@@ -1,0 +1,59 @@
+# =============================================================
+# Default configuration for the LLM Data Curator.
+# Every value here can be overridden from the command line via
+# utils/options.py, e.g.:
+#   python main.py --dataset a --method less --budget 0.05
+#   python main.py -o train.lr=1e-5 -o model.load_in_8bit=true
+# =============================================================
+
+# ---- Experiment ----
+seed: 42
+device: cuda                 # cuda | cpu | mps
+output_dir: ./outputs
+
+# ---- Model ----
+model:
+  name: meta-llama/Llama-2-7b-hf
+  tokenizer_name: null        # null -> use `model.name`
+  max_length: 2048
+  torch_dtype: bfloat16       # float32 | float16 | bfloat16
+  load_in_8bit: false
+  trust_remote_code: false
+
+# ---- LoRA (used for the warmup / influence model) ----
+lora:
+  enable: true
+  r: 8
+  alpha: 16
+  dropout: 0.1
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+# ---- Dataset ----
+# `name` selects the loader module dataset/load_<name>.py
+dataset:
+  name: a
+  data_dir: ./data
+  validation_split: 0.05
+
+# ---- Selection ----
+# `method` selects the algorithm module alg/<method>.py
+# Method-specific parameters are declared by each algorithm's add_args() in
+# alg/<method>.py and loaded dynamically by utils/options.py. Discover them with:
+#   python main.py --method <name> --help
+selection:
+  method: less
+  budget: 0.05                # fraction (<=1) of train set to keep, or an int count
+
+# ---- Training (final run on the selected subset) ----
+train:
+  epochs: 3
+  batch_size: 4
+  grad_accum: 8
+  lr: 2.0e-5
+  warmup_ratio: 0.03
+  weight_decay: 0.0
+  logging_steps: 10
+  save_strategy: epoch
+  bf16: true
+  fp16: false
+  gradient_checkpointing: true
