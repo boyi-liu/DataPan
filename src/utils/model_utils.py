@@ -26,7 +26,7 @@ def load_tokenizer(cfg):
 def load_model(cfg):
     kwargs = {"trust_remote_code": bool(cfg.model.trust_remote_code)}
     if cfg.model.torch_dtype:
-        kwargs["torch_dtype"] = _DTYPE[cfg.model.torch_dtype]
+        kwargs["dtype"] = _DTYPE[cfg.model.torch_dtype]
     if cfg.model.load_in_8bit:
         kwargs["load_in_8bit"] = True
         kwargs["device_map"] = "auto"
