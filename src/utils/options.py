@@ -21,10 +21,16 @@ Usage:
 import argparse
 import importlib
 import os
+import warnings
 
 import yaml
 
 DEFAULT_CONFIG = os.path.join(os.path.dirname(__file__), os.pardir, "config.yaml")
+
+#: The modular selector (alg/default.py), used when no --method is given. It
+#: composes a scorer + policy from config, so it needs a scorer to fall back to.
+DEFAULT_METHOD = "default"
+DEFAULT_SCORER = "bm25"
 
 
 class Config(dict):
@@ -96,6 +102,8 @@ def build_parser():
 
     p.add_argument("--method", dest="selection.method")
     p.add_argument("--budget", type=float, dest="selection.budget")
+    p.add_argument("--scorer", dest="selection.scorer")
+    p.add_argument("--policy", dest="selection.policy")
 
     p.add_argument("--epochs", type=int, dest="train.epochs")
     p.add_argument("--batch-size", type=int, dest="train.batch_size")
@@ -108,16 +116,20 @@ def build_parser():
     return p
 
 
-def _add_method_args(parser, method):
-    """Load ``alg/<method>.add_args`` and register its flags on ``parser``.
+def _add_plugin_args(parser, package, name):
+    """Load ``<package>/<name>.add_args`` and register its flags on ``parser``.
 
-    Returns the set of ``dest`` names the method added, so the merge step knows
-    to always apply them (their defaults live in the algorithm, not config.yaml).
+    Shared by the selection algorithm (``alg/<method>.py``) and the selection
+    policy (``policy/<name>.py``), which both own their hyper-parameters this
+    way. Returns the set of ``dest`` names added, so the merge step knows to
+    always apply them (their defaults live in the plugin, not config.yaml).
     """
+    if not name:
+        return set()
     try:
-        module = importlib.import_module(f"alg.{method}")
+        module = importlib.import_module(f"{package}.{name}")
     except ModuleNotFoundError:
-        return set()  # unknown method; get_selector() will report it clearly
+        return set()  # unknown plugin; get_selector()/get_policy() reports it clearly
     add_args = getattr(module, "add_args", None)
     if add_args is None:
         return set()
@@ -126,26 +138,87 @@ def _add_method_args(parser, method):
     return {a.dest for a in parser._actions if id(a) not in before}
 
 
+def _default_policy(method):
+    """A method may declare ``DEFAULT_POLICY`` in ``alg/<method>.py`` (e.g. ADAPT
+    -> 'reweight'), used when neither the CLI nor config.yaml pins ``--policy``."""
+    if not method:
+        return None
+    try:
+        module = importlib.import_module(f"alg.{method}")
+    except ModuleNotFoundError:
+        return None
+    return getattr(module, "DEFAULT_POLICY", None)
+
+
 def parse_args(argv=None):
-    # Phase 1: sniff --config and --method without triggering help / validation.
+    # Phase 1: sniff --config/--method/--scorer/--policy without triggering help.
     sniff = argparse.ArgumentParser(add_help=False)
     sniff.add_argument("--config", default=DEFAULT_CONFIG)
     sniff.add_argument("--method")
+    sniff.add_argument("--scorer")
+    sniff.add_argument("--policy")
     pre, _ = sniff.parse_known_args(argv)
     cfg = load_config(pre.config)
-    method = pre.method or cfg.selection.method
+    # 'default' is the modular selector (alg/default.py): it builds its scorer +
+    # policy from config, so omitting --method just runs it.
+    method = pre.method or cfg.selection.method or DEFAULT_METHOD
+    cfg.set_path("selection.method", method)
+    # User-chosen scorer / policy (explicit --flag > config.yaml); None == "unset".
+    user_scorer = pre.scorer or cfg.selection.scorer
+    user_policy = pre.policy or cfg.selection.policy
 
-    # Phase 2: build the full parser and let the chosen algorithm add its flags.
+    if method == DEFAULT_METHOD:
+        # Only the 'default' selector composes scorer + policy from config. The
+        # scorer falls back to a built-in one so a bare `python main.py` runs;
+        # the policy falls back to 'hard'. Their plugin flags load from the
+        # resolved names below.
+        scorer = user_scorer or DEFAULT_SCORER
+        policy = user_policy or "hard"
+    else:
+        # A custom method defines its own scorer *and* policy, so a pinned scorer
+        # or policy is ignored -- warn rather than let it look applied. The policy
+        # is forced to the method's own default (e.g. ADAPT -> reweight, else
+        # 'hard'); choose method='default' to compose a scorer with a policy.
+        ignored = []
+        if user_scorer:
+            ignored.append(f"scorer={user_scorer!r}")
+        if user_policy:
+            ignored.append(f"policy={user_policy!r}")
+        if ignored:
+            warnings.warn(
+                f"selection.method={method!r} is a custom selector that defines "
+                f"its own scorer and policy; the configured {', '.join(ignored)} "
+                f"will be ignored. Use method='default' to compose a scorer with "
+                f"a policy.",
+                stacklevel=2,
+            )
+        scorer = None  # custom methods hard-wire their own scorer
+        policy = _default_policy(method) or "hard"
+
+    # Write the resolved values back so the plugin-arg loader, get_scorer() and
+    # get_policy() all see them.
+    cfg.set_path("selection.scorer", scorer)
+    cfg.set_path("selection.policy", policy)
+
+    # Phase 2: build the full parser and let the chosen algorithm + scorer +
+    # policy add their flags (defaults live in the plugin, so their dests always
+    # apply). The scorer's flags load for the modular selector; for a thin
+    # per-scorer alg they are re-exported via the method module instead.
     parser = build_parser()
-    method_dests = _add_method_args(parser, method) if method else set()
+    plugin_dests = _add_plugin_args(parser, "alg", method)
+    plugin_dests |= _add_plugin_args(parser, "scorer", scorer)
+    plugin_dests |= _add_plugin_args(parser, "policy", policy)
     args = parser.parse_args(argv)
 
-    # Apply curated + method flags. Method flags always apply (defaults live in
-    # the algorithm); curated flags only when explicitly set (default None).
+    # Apply curated + plugin flags. Plugin flags always apply (defaults live in
+    # the plugin); curated flags only when explicitly set (default None).
+    # selection.scorer/policy are already fully resolved in Phase 1 (a custom
+    # method deliberately overrides what the user passed), so skip them here --
+    # otherwise the raw --scorer/--policy values would clobber that resolution.
     for dest, value in vars(args).items():
-        if dest in ("config", "override"):
+        if dest in ("config", "override", "selection.scorer", "selection.policy"):
             continue
-        if dest in method_dests or value is not None:
+        if dest in plugin_dests or value is not None:
             cfg.set_path(dest, value)
 
     # Generic overrides have the final say.
