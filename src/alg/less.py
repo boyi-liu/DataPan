@@ -22,7 +22,7 @@ Pipeline implemented here:
        cosine between their features; we average over the target set, weight by
        the checkpoint's learning rate, and sum across checkpoints.
 
-`BaseSelector.topk_by_score` then keeps the highest-influence examples up to
+`BaseSelector.apply_policy` then keeps the highest-influence examples up to
 `cfg.selection.budget`.
 
 Notes
@@ -42,6 +42,7 @@ import numpy as np
 import torch
 
 from alg.base import BaseSelector
+from policy.hard import Policy  # ④ policy loaded directly (get_policy is for `default`)
 from utils.model_utils import maybe_wrap_lora
 from utils.selector_utils import model_inputs, tqdm
 
@@ -117,6 +118,7 @@ class Selector(BaseSelector):
             )
         if model is None or tokenizer is None:
             raise ValueError("LESS needs a model and tokenizer.")
+        self.policy = Policy(cfg)
 
         self.device = cfg.device
         sel = cfg.selection
@@ -162,7 +164,7 @@ class Selector(BaseSelector):
                 agg = sim.mean(axis=1)
             influence += weight * agg
 
-        return self.topk_by_score(influence)
+        return self.apply_policy(influence)
 
     # ---- step 1: warmup ----------------------------------------------------
 

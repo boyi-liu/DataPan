@@ -36,7 +36,7 @@ Pipeline (paper Sec. 3):
        model is used *only* for scoring.
     2. Evaluating based on Experience. Compute IFD over the full dataset with
        that model.
-    3. Retraining from Self-Guided Experience. `BaseSelector.topk_by_score`
+    3. Retraining from Self-Guided Experience. `BaseSelector.apply_policy`
        keeps the highest-IFD samples up to `cfg.selection.budget`, and the
        generic Trainer fine-tunes on them.
 
@@ -53,6 +53,7 @@ import numpy as np
 import torch
 
 from alg.base import BaseSelector
+from policy.hard import Policy  # ④ policy loaded directly (get_policy is for `default`)
 from utils.model_utils import maybe_wrap_lora
 from utils.selector_utils import batched, mean_pool, model_inputs, tqdm
 
@@ -66,6 +67,7 @@ class Selector(BaseSelector):
         super().__init__(cfg, model, tokenizer)
         if model is None or tokenizer is None:
             raise ValueError("IFD needs a model and tokenizer.")
+        self.policy = Policy(cfg)
 
         self.device = cfg.device
         sel = cfg.selection
@@ -107,7 +109,7 @@ class Selector(BaseSelector):
         # Filtered samples (IFD >= max, or undefined) sink below every valid one
         # so they are only ever picked when the budget exceeds the valid pool.
         scores = np.where(valid, ifd, -np.inf)
-        return self.topk_by_score(scores.tolist())
+        return self.apply_policy(scores.tolist())
 
     # ---- step 1: learning from brief experience ----------------------------
 

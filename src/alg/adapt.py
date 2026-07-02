@@ -34,16 +34,25 @@ implemented:
   * ``bm25`` (ADAPT-BM25, the model-agnostic variant, Sec. 5.2). A static sparse
     retrieval signal: s_BM25(x) = mean_v BM25(x, v). Precomputed once.
 
-The score is mapped to an *absolute* weight with a temperature-scaled sigmoid
-(Eq. 11). Crucially this is a *global* (per-sample) transform -- it does NOT
-normalize over the batch (contrast with softmax weighting), so a sample's weight
-depends only on its own similarity, not on its batch-mates:
+The score is mapped to a per-sample weight by the ④ **policy** -- ADAPT's
+headline form is the temperature-scaled sigmoid (Eq. 11; ``policy/reweight.py``):
 
     w_t(i) = sigmoid( s_ADAPT(x_i) / max(tau, eps) )
 
-Weights are treated as stop-gradient scalar multipliers and clipped for
-stability. ADAPT does not change the dataset size, so :meth:`select` returns
-*all* indices; the reweighting lives in :class:`ADAPTTrainer`, wired in through
+Crucially this is a *global* (per-sample) transform -- it does NOT normalize over
+the batch (contrast with softmax weighting), so a sample's weight depends only on
+its own similarity, not on its batch-mates. Weights are stop-gradient scalar
+multipliers, clipped for stability.
+
+Because the score -> weight step is just a policy, **online data selection** is
+the same loop with a different policy: ``--policy hard`` keeps only the top-k of
+each batch (a ``{0, 1}`` mask) instead of softly reweighting -- selection is the
+binary special case of reweighting. (This masks the loss; it does not yet skip
+the forward/backward of dropped samples, so it changes the gradient, not the
+per-step compute -- a compute-saving oversample loop is a separate extension.)
+
+ADAPT never changes the dataset size, so :meth:`select` returns *all* indices;
+the per-batch scoring + policy lives in :class:`ADAPTTrainer`, wired in through
 :meth:`BaseSelector.make_trainer`.
 """
 
@@ -54,6 +63,7 @@ import torch.nn.functional as F
 from transformers import DataCollatorForSeq2Seq, Trainer
 
 from alg.base import BaseSelector
+from policy.reweight import Policy  # ④ policy loaded directly (get_policy is for `default`)
 from utils.model_utils import maybe_wrap_lora
 from utils.selector_utils import tqdm
 
@@ -108,10 +118,13 @@ class _BM25:
 # Reweighter: turns a (batch, anchors) pair into per-sample weights
 # --------------------------------------------------------------------------- #
 class ADAPTReweighter:
-    """Computes the per-sample learning-rate multipliers ``w_t(i)``.
+    """Computes ADAPT's per-sample quality **score** ``s(x_i)`` for a batch.
 
     Owns the anchor centroid (for ``embed``) or the precomputed per-example BM25
-    scores (for ``bm25``), the sigmoid gating, and the online anchor refresh.
+    scores (for ``bm25``), the online anchor refresh, and the weighted-loss
+    reduction. The score -> weight map (the sigmoid gate, or a top-k mask for
+    in-batch selection) is *not* here: it is the swappable ④ policy applied by
+    :class:`ADAPTTrainer`. This keeps reweighting and selection as one primitive.
     """
 
     def __init__(self, cfg, tokenizer, val_dataset):
@@ -121,14 +134,11 @@ class ADAPTReweighter:
         self.val_dataset = val_dataset
 
         self.signal = (sel.signal or "embed").lower()
-        self.tau = float(sel.tau if sel.tau is not None else 1.0)
         self.eps = float(sel.eps if sel.eps is not None else 1e-8)
         self.refresh_interval = int(sel.refresh_interval or 50)
         self.encode_batch = int(sel.encode_batch or 8)
         self.weight_norm = (sel.weight_norm or "mean").lower()
-        self.w_min = float(sel.w_min if sel.w_min is not None else 0.0)
-        self.w_max = float(sel.w_max if sel.w_max is not None else 10.0)
-        self.standardize = bool(sel.standardize_signal) 
+        self.standardize = bool(sel.standardize_signal)
 
         self.needs_hidden = self.signal == "embed"
         self.anchor_centroid = None        # (d,) float32, embed signal only
@@ -202,19 +212,15 @@ class ADAPTReweighter:
             scores = (scores - scores.mean()) / (scores.std() + self.eps)
         self.bm25_scores = scores
 
-    # ---- weights (Eq. 11) --------------------------------------------------
-    def _gate(self, score):
-        w = torch.sigmoid(score / max(self.tau, self.eps))
-        return w.clamp(min=self.w_min, max=self.w_max).detach()
-
-    def weights(self, hidden, attention_mask, idx, model, step):
+    # ---- per-batch quality score (pre-policy) ------------------------------
+    def scores(self, hidden, attention_mask, idx, model, step):
+        """Raw per-sample score s(x_i) for the batch; the ④ policy gates it."""
         if self.signal == "embed":
             self.maybe_refresh(model, step)
             phi = self._pool(hidden, attention_mask)         # (B, d)
-            score = phi @ self.anchor_centroid.to(phi.dtype)  # (B,)
-        else:  # bm25
-            score = self.bm25_scores.to(attention_mask.device)[idx]
-        return self._gate(score)
+            return phi @ self.anchor_centroid.to(phi.dtype)   # (B,)
+        # bm25
+        return self.bm25_scores.to(attention_mask.device)[idx]
 
     # ---- combine per-sample loss with weights -----------------------------
     def combine(self, per_sample_loss, w):
@@ -230,16 +236,20 @@ class ADAPTReweighter:
 # Trainer: applies the per-sample weighted loss in the optimization loop
 # --------------------------------------------------------------------------- #
 class ADAPTTrainer(Trainer):
-    """A :class:`~transformers.Trainer` that reweights the per-sample loss.
+    """A :class:`~transformers.Trainer` that applies an online ④ policy per batch.
 
     One forward pass yields both the logits (for a per-sample LM loss) and the
-    last-layer hidden states (for the ``embed`` signal), so reweighting adds only
-    the lightweight in-loop scoring the paper calls ``F^on_metrics``.
+    last-layer hidden states (for the ``embed`` signal). The reweighter turns
+    those into a per-sample score; the **policy** maps the score to per-sample
+    weights -- continuous (``reweight``, the headline ADAPT method) or a binary
+    in-batch top-k mask (``hard``, online data selection). Both are the same
+    weighted-loss application, differing only in the policy.
     """
 
-    def __init__(self, *args, reweighter=None, **kwargs):
+    def __init__(self, *args, reweighter=None, policy=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.reweighter = reweighter
+        self.policy = policy
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         idx = inputs.pop("idx", None)
@@ -258,9 +268,14 @@ class ADAPTTrainer(Trainer):
         per_sample = (tok_loss * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)
 
         hidden = outputs.hidden_states[-1] if self.reweighter.needs_hidden else None
-        w = self.reweighter.weights(
+        score = self.reweighter.scores(
             hidden, inputs["attention_mask"], idx, model, self.state.global_step
         )
+        # Score -> weights via the configured policy. The batch is small, so the
+        # detach/cpu round-trip is negligible and keeps one policy for both
+        # offline and online; weights are stop-gradient multipliers either way.
+        w = self.policy.weights(score.detach().to(torch.float32).cpu().numpy())
+        w = torch.as_tensor(w, device=per_sample.device, dtype=per_sample.dtype)
         loss = self.reweighter.combine(per_sample, w)
         return (loss, outputs) if return_outputs else loss
 
@@ -298,6 +313,7 @@ class Selector(BaseSelector):
         super().__init__(cfg, model, tokenizer)
         if model is None or tokenizer is None:
             raise ValueError("ADAPT needs a model and tokenizer.")
+        self.policy = Policy(cfg)
         self.reweighter = None
 
     # ADAPT keeps the full dataset; "selection" is the identity map.
@@ -347,21 +363,33 @@ class Selector(BaseSelector):
             eval_dataset=val_dataset,
             data_collator=collator,
             reweighter=reweighter,
+            policy=self.policy,            # reweight (default) or hard (in-batch selection)
             **{TRAINER_TOKENIZER_KW: tokenizer},
         )
 
 
+# ADAPT is an online method: it keeps the full dataset and applies a policy to
+# the per-sample loss each step. Its headline form is soft reweighting, so it
+# loads the 'reweight' policy directly above (swap that import for policy.hard to
+# get online in-batch selection instead). DEFAULT_POLICY mirrors that choice so
+# utils.options loads the right policy's CLI flags -- the gate knobs (tau, w_min,
+# w_max) live with the reweight policy (policy/reweight.py). Keep the two in sync.
+DEFAULT_POLICY = "reweight"
+
+
 def add_args(parser):
-    """Register ADAPT-specific CLI arguments (loaded dynamically by utils.options)."""
+    """Register ADAPT-specific CLI arguments (loaded dynamically by utils.options).
+
+    Scoring knobs only -- the score -> weight mapping is the ④ policy's job, so
+    tau / w_min / w_max are registered by policy/reweight.py instead.
+    """
     g = parser.add_argument_group("ADAPT")
     g.add_argument("--adapt-signal", choices=["embed", "bm25"], default="embed",
                    dest="selection.signal",
                    help="Quality signal: 'embed' (model-state, ADAPT) or 'bm25' "
                         "(model-agnostic, ADAPT-BM25).")
-    g.add_argument("--adapt-tau", type=float, default=1.0, dest="selection.tau",
-                   help="Sigmoid temperature; larger -> flatter weights.")
     g.add_argument("--adapt-eps", type=float, default=1e-8, dest="selection.eps",
-                   help="Numerical-stability constant.")
+                   help="Numerical-stability constant (pooling/standardization).")
     g.add_argument("--adapt-refresh-interval", type=int, default=50,
                    dest="selection.refresh_interval",
                    help="Refresh the anchor embeddings every R steps (embed signal).")
@@ -372,12 +400,9 @@ def add_args(parser):
                    default="mean", dest="selection.weight_norm",
                    help="How weighted per-sample losses are combined: 'mean' "
                         "(keep mean-loss scale), 'sum' (paper Eq. 7), or 'zsum' "
-                        "(normalize by sum of weights, Sec. 3.3).")
-    g.add_argument("--adapt-w-min", type=float, default=0.0, dest="selection.w_min",
-                   help="Lower clip on per-sample weights.")
-    g.add_argument("--adapt-w-max", type=float, default=10.0, dest="selection.w_max",
-                   help="Upper clip on per-sample weights (prevents LR explosion).")
+                        "(normalize by sum of weights, Sec. 3.3 -- the natural "
+                        "choice for --policy hard, i.e. mean over the kept set).")
     g.add_argument("--adapt-standardize-signal", action="store_true",
                    dest="selection.standardize_signal",
-                   help="Standardize the raw score before the sigmoid "
+                   help="Standardize the raw score before the policy gate "
                         "(recommended for the bm25 signal).")

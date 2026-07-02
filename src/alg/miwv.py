@@ -35,7 +35,7 @@ The method has three steps (paper Sec. 3):
      sample teaches little; a high value there also keeps diversity, since an
      irrelevant neighbour that fails to help still surfaces the sample.
 
-  3. High-Quality Data Selection. ``BaseSelector.topk_by_score`` keeps the
+  3. High-Quality Data Selection. ``BaseSelector.apply_policy`` keeps the
      highest-MIWV samples up to ``cfg.selection.budget`` and the generic Trainer
      fine-tunes on them.
 
@@ -58,6 +58,7 @@ import torch
 import torch.nn.functional as F
 
 from alg.base import BaseSelector
+from policy.hard import Policy  # ④ policy loaded directly (get_policy is for `default`)
 from utils.selector_utils import batched, mean_pool, tqdm
 
 
@@ -66,6 +67,7 @@ class Selector(BaseSelector):
         super().__init__(cfg, model, tokenizer)
         if model is None or tokenizer is None:
             raise ValueError("MIWV needs a model and tokenizer.")
+        self.policy = Policy(cfg)
 
         self.device = cfg.device
         sel = cfg.selection
@@ -99,7 +101,9 @@ class Selector(BaseSelector):
 
         # Unscorable examples (no response tokens) sink to the bottom.
         scores = np.where(valid, miwv, -np.inf)
-        return self.topk_by_score(scores.tolist())
+        # Reuse the retrieval embeddings as policy features, so interaction-aware
+        # policies (e.g. --policy diversity) can cover the feature space.
+        return self.apply_policy(scores.tolist(), features=emb.numpy())
 
     # ---- step 1: one-shot retrieval ---------------------------------------
 

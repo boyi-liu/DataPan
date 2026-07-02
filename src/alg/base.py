@@ -6,10 +6,23 @@ from abc import ABC, abstractmethod
 class BaseSelector(ABC):
     """Selects a subset of the training data.
 
+    A selector owns the *scoring* side of the taxonomy -- which signal defines
+    data value (①), measured against what (②), with which model (③). Turning
+    those scores into a concrete subset (the ④ Selection Policy axis) is
+    delegated to a swappable :mod:`policy`. Each hand-written selector wires its
+    policy up *explicitly* in ``__init__`` by importing the class it wants, just
+    like it imports its scorer (``from policy.hard import Policy`` ->
+    ``self.policy = Policy(cfg)``); the dependency is then visible at the call
+    site. Score-based subclasses call :meth:`apply_policy` instead of
+    re-implementing budget/top-k handling.
+
+    (Only the config-driven ``default`` selector resolves its policy *by name*
+    via :func:`policy.get_policy`; concrete methods name theirs directly so the
+    ``--policy`` flag stays scoped to ``default``.)
+
     Subclasses (in ``alg/<method>.py``) implement :meth:`select` directly, so
-    methods that don't fit a per-example scoring model (clustering, dedup,
-    coreset, ...) are first-class. Score-based methods can use the
-    :meth:`topk_by_score` helper to avoid re-implementing budget handling.
+    methods that don't fit a per-example scoring model (random, clustering,
+    coreset, ...) are first-class and may ignore the policy.
     """
 
     def __init__(self, cfg, model=None, tokenizer=None):
@@ -31,18 +44,17 @@ class BaseSelector(ABC):
         return None
 
     # ---- helpers for subclasses -------------------------------------------
+    # Reads ``self.policy``, which each selector sets explicitly in its
+    # ``__init__`` by importing the policy class it wants (the ``default``
+    # selector is the only one that resolves it via ``get_policy(cfg)``).
 
-    def _budget_to_k(self, n):
-        """Resolve ``cfg.selection.budget`` into an absolute count for ``n`` examples."""
-        budget = self.cfg.selection.budget
-        k = int(round(budget * n)) if budget <= 1 else int(budget)
-        return max(1, min(k, n))
+    def apply_policy(self, scores, features=None):
+        """Turn per-example ``scores`` into selected indices via the ④ policy.
 
-    def topk_by_score(self, scores):
-        """Pick the highest-scoring examples, honoring the configured budget.
-
-        Convenience for score-based selectors; returns sorted indices.
+        ``scores`` follow the convention *higher == more valuable* (selectors
+        that prefer low values negate first; unscorable examples sink to
+        ``-inf``). ``features`` are optional ``(N, d)`` per-example vectors that
+        interaction-aware policies (e.g. ``diversity``) require and score-only
+        policies ignore. Returns sorted indices.
         """
-        k = self._budget_to_k(len(scores))
-        ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
-        return sorted(ranked[:k])
+        return self.policy.select(scores, features=features)
