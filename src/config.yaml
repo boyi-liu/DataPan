@@ -13,7 +13,7 @@ output_dir: ./outputs
 
 # ---- Model ----
 model:
-  name: meta-llama/Llama-2-7b-hf
+  name: Qwen/Qwen2.5-3B-Instruct
   tokenizer_name: null        # null -> use `model.name`
   max_length: 2048
   torch_dtype: bfloat16       # float32 | float16 | bfloat16
@@ -29,21 +29,56 @@ lora:
   target_modules: [q_proj, k_proj, v_proj, o_proj]
 
 # ---- Dataset ----
-# `name` selects the loader module dataset/load_<name>.py
-#   a   -> single JSONL (dataset/load_a.py)
+# `name` selects the module dataset/load_<name>.py, which builds
+# {data_dir}/<name>.jsonl on first use and then loads it. Available:
+#   alpaca   -> Stanford Alpaca 52k (Hub)
+#   wizardlm -> WizardLM Evol-Instruct (Hub)
+#   less     -> FLAN V2 + CoT + Dolly + OpenAssistant1 mixture (local Tulu files)
+# Optional prep knobs (read when the cache is built), e.g. via -o or here:
+#   sample_percentage: 0.05      # fraction of each source to keep
+#   source: tatsu-lab/alpaca     # override the Hub id (alpaca / wizardlm)
+#   data_files: ./raw/alpaca.json  # local source file instead of the Hub
+#   processed_dir: ./raw         # (less) dir with the four Tulu *_data.jsonl files
 dataset:
-  name: a
+  name: alpaca
   data_dir: ./data
   validation_split: 0.05
 
 # ---- Selection ----
-# `method` selects the algorithm module alg/<method>.py
-# Method-specific parameters are declared by each algorithm's add_args() in
-# alg/<method>.py and loaded dynamically by utils/options.py. Discover them with:
-#   python main.py --method <name> --help
+# Two ways to run, sharing one Scorer -> Policy -> Timing design:
+#
+#   1. Default (config-only): the `default` method composes a `scorer` (axes ①②③,
+#      scorer/<scorer>.py) with a `policy` (axis ④) dynamically -- no glue code.
+#      It is the default `method`, so just set `scorer`/`policy` (or pass --scorer/
+#      --policy) and `--method` can be omitted:
+#        python main.py --scorer bm25 --policy hard
+#      Available scorers: bm25, embedding, ppl. Discover their knobs with
+#        python main.py --scorer <s> --policy <p> --help
+#
+#   2. Custom (fine-grained): set `method` to a hand-written alg/<method>.py
+#      (less, ifd, greats, adapt, miwv, random, ...) that wires its own scorer
+#      and policy -- use when name + policy isn't enough (multiple scorers, a
+#      custom reweighting trainer, ...). Its knobs come from alg/<method>.add_args():
+#        python main.py --method less --help
+#      Such a method defines its own scorer AND policy, so both `scorer` and
+#      `policy` (and --scorer/--policy) are ignored once `method` is not `default`
+#      -- a warning is printed. The method's policy is its module-level
+#      DEFAULT_POLICY (e.g. adapt -> reweight, greats -> greats), else hard.
+#
+# `scorer` and `policy` therefore only take effect for the `default` method:
+# `policy` (the ④ axis) maps scores to per-sample weights, blind to what the
+# score means. It selects policy/<policy>.py:
+#   hard       -> top-k mask (default; diversity-blind, the original behavior)
+#   diversity  -> k-center coverage over example features (needs a scorer that
+#                 exposes features: embedding, miwv)
+#   reweight   -> soft continuous weights (online; ADAPT's gate). Selection is
+#                 the binary special case of reweighting -- same `weights()` map.
+# For the `default` method, `policy: null` -> hard and `scorer: null` -> bm25.
 selection:
-  method: less
+  method: default
   budget: 0.05                # fraction (<=1) of train set to keep, or an int count
+  scorer: null                # `default` method only: picks scorer/<scorer>.py (null -> bm25)
+  policy: null
 
 # ---- Training (final run on the selected subset) ----
 train:
