@@ -1,4 +1,4 @@
-# DataPan
+# DataPan: Agentic Data Selection for LLM Finetuning
 
 ![Logo](./assets/datapan.png)
 
@@ -23,6 +23,23 @@ python main.py --scorer embedding --policy diversity --budget 0.05   # default m
 python main.py --method less --budget 0.05 --benchmark gsm8k
 python main.py --method random --no-train          # baseline, selection only
 ```
+
+### Static → manual → agentic
+
+DataPan supports **three ways to drive data selection**, differing only in *who
+decides which operators run* — the operators and the engine (`main.run_pipeline`)
+are shared across all three:
+
+| Mode | Who plans the cascade | How |
+|------|----------------------|-----|
+| **Static** | you — a single operator | `python main.py --method less --budget 0.05` — a one-stage run |
+| **Manual pipeline** | you — a hand-authored cascade | a `pipeline:` list of stages, each filtering the previous stage's survivors |
+| **Agentic** | an **LLM**, from the run's live state | `pipeline_planner: {type: llm}` — the model picks each stage under guardrails, no fixed list |
+
+The agentic mode is the newest: instead of a pre-written pipeline, an LLM
+controller observes the run's *structural* state (survivors left, budget spent,
+operators already used) and orchestrates the cascade itself. See
+[Four Ways to Use It](#four-ways-to-use-it) for the details of each.
 
 ---
 
@@ -78,7 +95,10 @@ python main.py --method less --help
 
 ---
 
-## Three Ways to Use It
+## Four Ways to Use It
+
+Modes 1–3 decide the stages **up front** (a fixed list, even if it's a single
+stage); mode 4 lets an **LLM decide them at run time**.
 
 ### 1. Modular composition — pick a scorer + a policy (no code)
 
@@ -214,6 +234,52 @@ generic Trainer. If the **last** stage's operator injects a trainer (an online
 method like `adapt`), the run uses that instead — so a pipeline can end on
 per-step reweighting.
 
+### 4. Agentic — let an LLM plan the cascade
+
+Modes 1–3 fix the stages before the run starts. The **agentic** mode hands that
+decision to an **LLM controller**: at each step it sees the run's live
+*structural* state — how many examples survive, how much budget is spent, which
+operators already ran — and picks the next operator (or stops). No fixed list, no
+per-stage planning by you; set an objective and turn it on in `config.yaml`:
+
+```yaml
+pipeline_planner:
+  type: llm                 # omit / `list` -> the static `pipeline:` below runs as written
+  model: gpt-5-mini         # an OpenAI-compatible controller LLM (see env below)
+  max_stages: 6             # hard cap on cascade length
+  min_keep: 0.01            # stop once survivors fall to this fraction of the original
+  goal: "Select a small, high-quality subset for math reasoning."
+```
+
+```bash
+export OPENAI_API_KEY=...             # controller endpoint credentials
+export OPENAI_BASE_URL=...            # optional; defaults to the OpenAI API
+python main.py                        # the LLM now orchestrates each stage
+```
+
+The controller composes the **same operators** as every other mode, just
+adaptively — e.g. a cheap `ppl` pass on a small model to prune, then a precise
+`less` pass on the survivors, then stop once the set is small and clean. It plans
+from **structural signals only — no per-step evaluation** — so it stays cheap and
+never touches the GPU (the controller LLM is separate from the local model being
+fine-tuned).
+
+**Guardrails** keep an autonomous planner honest:
+
+| Guardrail | What it enforces |
+|-----------|------------------|
+| **Step cap** | Never exceed `max_stages` stages. |
+| **Budget floor** | Every stage must *shrink* the survivor set; the cascade stops once `kept_fraction ≤ min_keep`. |
+| **Operator validity** | A hallucinated `method`/`scorer`/`policy` is rejected and the model is re-prompted; after `max_retries` it stops safely rather than looping. |
+| **Decision log** | Every prompt, raw reply and verdict is appended to `<output_dir>/planner_decisions.jsonl`. |
+
+> **Reproducibility.** An LLM planner is non-deterministic. For comparable runs,
+> pin `temperature: 0` and keep `planner_decisions.jsonl` — it captures the exact
+> sequence of decisions. The seam lives in the `src/planner/` package —
+> `planner/base.py` (the pluggable `Planner` + static `ListPlanner` that replays
+> `pipeline:`) and `planner/llm.py` (the `LLMPlanner` controller); `main.run_pipeline`
+> drives whichever planner `pipeline_planner.type` selects.
+
 ---
 
 ## Demo — DataPan UI (Streamlit)
@@ -231,11 +297,14 @@ Flow (top → bottom of the page):
 
 1. **Upload** an instruction dataset (`.jsonl` / `.json`; `{instruction, input,
    output}`, chat `messages`, or `prompt/response` schemas are auto-mapped).
-2. **Build a pipeline** as a stack of operator **cards** — each card is one stage
-   (**name · method · proxy model · budget · scorer · policy**, plus optional
-   `reference` and method knobs). Add/remove cards and reorder with ▲/▼; the cascade
-   runs top → bottom, each stage filtering the previous stage's survivors — the
-   visual counterpart of the `pipeline:` list above.
+2. **Orchestrate selection**, in either of two modes (a toggle at the top):
+   - **Manual pipeline** — stack operator **cards**, each one stage (**name ·
+     method · proxy model · budget · scorer · policy**, plus optional `reference`
+     and method knobs). Add/remove and reorder with ▲/▼; the cascade runs top →
+     bottom — the visual counterpart of the `pipeline:` list above.
+   - **Agentic** — an **LLM controller** plans the cascade from live state (set
+     the controller model / `max_stages` / `min_keep` / `goal`) — the visual
+     counterpart of the `pipeline_planner: {type: llm}` mode above.
 3. **Run selection**, then **download** the distilled subset as `.jsonl`, or
    **fine-tune** end-to-end on it.
 
@@ -281,3 +350,6 @@ to `{data_dir}/<name>.jsonl` on first use.
 - **Alpaca** — Stanford Alpaca 52k
 - **WizardLM** — Evol-Instruct
 - **LESS** — mixture of Flan V2, CoT, Dolly and Open Assistant
+- **GSM8K** — grade-school math word problems
+- **BioInstruct** — 25k biomedical instructions
+- **DialogSum** — dialogue summarization

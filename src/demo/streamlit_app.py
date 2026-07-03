@@ -8,10 +8,14 @@ Run:
 
     streamlit run src/demo/streamlit_app.py
 
-Flow (top → bottom): upload an instruction dataset → assemble a cascade of
-selection operators as cards (name / method / proxy model / budget / scorer /
-policy, reorderable) → run selection → download the distilled subset →
-fine-tune end-to-end on it.
+Flow (top → bottom): upload an instruction dataset → orchestrate selection either
+as a **manual pipeline** (a reorderable cascade of operator cards) or **agentic**
+(an LLM controller plans each stage from live state) → run selection → download
+the distilled subset → fine-tune end-to-end on it.
+
+Agentic mode sets ``cfg.pipeline_planner`` (see ``planner.llm.LLMPlanner``); it
+runs for real only with the ML stack + a controller API key present, otherwise it
+hands back the ready-to-run config, like the "reproduce on a GPU host" panel.
 
 Selection runs for real via ``main.run_pipeline`` when PyTorch + transformers are
 importable; otherwise it falls back to a clearly-labelled budget-cascade
@@ -176,16 +180,23 @@ def card_to_stage(card):
     return stage
 
 
-def render_config_yaml(dataset, pipeline):
+def render_config_yaml(dataset, pipeline, planner=None):
+    doc = {"dataset": {"name": dataset}}
+    if planner:
+        doc["pipeline_planner"] = planner   # agentic: an LLM plans the stages
+    if pipeline or not planner:
+        doc["pipeline"] = pipeline
     try:
         import yaml
-        return yaml.safe_dump({"dataset": {"name": dataset}, "pipeline": pipeline},
-                              sort_keys=False, allow_unicode=True)
+        return yaml.safe_dump(doc, sort_keys=False, allow_unicode=True)
     except Exception:
-        return json.dumps({"dataset": {"name": dataset}, "pipeline": pipeline}, indent=2)
+        return json.dumps(doc, indent=2)
 
 
-def render_cli(dataset, pipeline):
+def render_cli(dataset, pipeline, planner=None):
+    if planner:
+        return ("# agentic (LLM-planned): save the YAML above as config.yaml, "
+                "set OPENAI_API_KEY, then:\npython main.py --config config.yaml")
     if len(pipeline) == 1:
         s = pipeline[0]
         parts = ["python main.py", f"--dataset {dataset}", f"--method {s.get('method','default')}"]
@@ -234,7 +245,7 @@ def simulate(records, pipeline, seed):
     return sorted(survivors), log
 
 
-def run_real(records, pipeline, seed, run_ws):
+def run_real(records, pipeline, seed, run_ws, planner_spec=None):
     from utils.options import load_config
     from utils.model_utils import load_model_and_tokenizer
     from dataset import get_dataset
@@ -251,6 +262,8 @@ def run_real(records, pipeline, seed, run_ws):
     cfg.set_path("dataset.validation_split", 0.0)  # keep file order == record order
     cfg.set_path("output_dir", run_ws)
     cfg["pipeline"] = pipeline
+    if planner_spec:  # agentic: let the LLM controller orchestrate (ignores `pipeline`)
+        cfg["pipeline_planner"] = planner_spec
     model, tokenizer = load_model_and_tokenizer(cfg)
     data = get_dataset(cfg, tokenizer)
     indices, _, log = pipeline_main.run_pipeline(
@@ -347,11 +360,41 @@ if ss.records:
 
 # ---- STEP 2: pipeline ----
 st.subheader("2 · Data selection pipeline")
-st.caption("Each card is one operator. The cascade runs top → bottom; each stage filters "
-           "the previous survivors. scorer & policy are editable **only** for method `default`.")
+mode = st.radio(
+    "How should the cascade be orchestrated?",
+    ["Manual pipeline", "Agentic — LLM plans the cascade"],
+    horizontal=True, key="orchestration_mode",
+    help="Manual: you stack operator cards. Agentic: an LLM picks each stage from the "
+         "run's live state (survivors, budget, history) under guardrails.")
+manual = mode.startswith("Manual")
+
+if not manual:
+    st.caption("An **LLM controller** picks each stage from the run's live *structural* state "
+               "— survivors left, budget spent, operators already used — no fixed list. "
+               "Guardrails: hard step cap, budget floor, operator-name validation, decision log.")
+    pc = st.columns(3)
+    ss.planner_model = pc[0].text_input("controller model", value=ss.get("planner_model") or "gpt-5-mini")
+    ss.planner_max = pc[1].number_input("max stages", value=int(ss.get("planner_max", 6)),
+                                        min_value=1, step=1)
+    ss.planner_minkeep = pc[2].text_input("min keep (fraction)",
+                                          value=str(ss.get("planner_minkeep") or "0.01"))
+    pc2 = st.columns(2)
+    ss.planner_base = pc2[0].text_input("base URL (optional)", value=ss.get("planner_base") or "",
+                                        placeholder="blank → OpenAI API / $OPENAI_BASE_URL")
+    ss.planner_key = pc2[1].text_input("API key (optional)", value=ss.get("planner_key") or "",
+                                       type="password", placeholder="blank → $OPENAI_API_KEY")
+    ss.planner_goal = st.text_area("goal", height=68,
+                                   value=ss.get("planner_goal") or "Select a small, high-quality subset.")
+    if not (stack_available() and (ss.planner_key or os.environ.get("OPENAI_API_KEY"))):
+        st.info("Agentic execution needs the ML stack **and** a controller API key. Without both, "
+                "*Run selection* shows the ready-to-run config instead of executing here.")
+
+if manual:
+    st.caption("Each card is one operator. The cascade runs top → bottom; each stage filters "
+               "the previous survivors. scorer & policy are editable **only** for method `default`.")
 
 n = len(ss.cards)
-for i, card in enumerate(ss.cards):
+for i, card in (enumerate(ss.cards) if manual else []):
     cid = card["id"]
     method_now = ss.get(f"method_{cid}", "default")
     with st.container(border=True):
@@ -390,81 +433,132 @@ for i, card in enumerate(ss.cards):
         r2[3].text_input("params (optional)", key=f"pr_{cid}",
                          placeholder="warmup_steps=100, projection_dim=4096")
 
-c1, c2, c3 = st.columns([1.4, 1, 4])
-if c1.button("➕ Add operator", use_container_width=True):
-    add_card()
-    st.rerun()
-seed = c2.number_input("seed", value=42, step=1, label_visibility="collapsed")
+if manual:
+    c1, _ = st.columns([1.4, 5])
+    if c1.button("➕ Add operator", use_container_width=True):
+        add_card()
+        st.rerun()
 
-# optional real drag-and-drop if the component is installed
-try:
-    from streamlit_sortables import sort_items  # type: ignore
+    # optional real drag-and-drop if the component is installed
+    try:
+        from streamlit_sortables import sort_items  # type: ignore
 
-    labels = []
-    for i, c in enumerate(ss.cards):
-        cid = c["id"]
-        name = ss.get(f"name_{cid}") or ss.get(f"method_{cid}")
-        labels.append(f"#{i + 1} {name}")
-    with st.expander("↕ Drag to reorder (optional component detected)"):
-        new_order = sort_items(labels, direction="vertical")
-        if new_order != labels:
-            order = [labels.index(lbl) for lbl in new_order]
-            ss.cards = [ss.cards[i] for i in order]
-            st.rerun()
-except ImportError:
-    pass
+        labels = []
+        for i, c in enumerate(ss.cards):
+            cid = c["id"]
+            name = ss.get(f"name_{cid}") or ss.get(f"method_{cid}")
+            labels.append(f"#{i + 1} {name}")
+        with st.expander("↕ Drag to reorder (optional component detected)"):
+            new_order = sort_items(labels, direction="vertical")
+            if new_order != labels:
+                order = [labels.index(lbl) for lbl in new_order]
+                ss.cards = [ss.cards[i] for i in order]
+                st.rerun()
+    except ImportError:
+        pass
+
+seed = st.number_input("seed", value=42, step=1)
 
 run = st.button("▶ Run selection", type="primary", disabled=ss.records is None)
 if ss.records is None:
     st.caption("Upload a dataset first (step 1) to enable selection.")
 
+def make_planner_spec(include_key):
+    """Build a `pipeline_planner` dict from the agentic form. ``include_key`` is
+    False for the rendered config.yaml so the API key is never shown."""
+    try:
+        mk = float(ss.get("planner_minkeep") or 0.01)
+    except (TypeError, ValueError):
+        mk = 0.01
+    spec = {"type": "llm",
+            "model": (ss.get("planner_model") or "gpt-5-mini").strip(),
+            "max_stages": int(ss.get("planner_max") or 6),
+            "min_keep": mk,
+            "goal": (ss.get("planner_goal") or "").strip()}
+    if (ss.get("planner_base") or "").strip():
+        spec["base_url"] = ss.planner_base.strip()
+    if include_key and (ss.get("planner_key") or "").strip():
+        spec["api_key"] = ss.planner_key.strip()
+    return spec
+
+
 if run and ss.records:
-    pipeline = [card_to_stage({
-        "name": ss.get(f"name_{c['id']}"), "method": ss.get(f"method_{c['id']}"),
-        "model": ss.get(f"model_{c['id']}"), "budget": ss.get(f"budget_{c['id']}"),
-        "scorer": ss.get(f"scorer_{c['id']}"), "policy": ss.get(f"policy_{c['id']}"),
-        "reference": ss.get(f"ref_{c['id']}"), "params": ss.get(f"pr_{c['id']}"),
-    }) for c in ss.cards]
     ss.run_id += 1
     run_ws = os.path.join(WORKSPACE, f"run{ss.run_id:04d}")
-    with st.spinner("Running selection…"):
-        res = run_selection(ss.records, pipeline, int(seed), run_ws, prefer_real=True)
-    indices = res["indices"]
-    ss.selected = [ss.records[i] for i in indices]
-    ss.result = {**res, "pipeline": pipeline, "num_total": len(ss.records)}
+    if manual:
+        pipeline = [card_to_stage({
+            "name": ss.get(f"name_{c['id']}"), "method": ss.get(f"method_{c['id']}"),
+            "model": ss.get(f"model_{c['id']}"), "budget": ss.get(f"budget_{c['id']}"),
+            "scorer": ss.get(f"scorer_{c['id']}"), "policy": ss.get(f"policy_{c['id']}"),
+            "reference": ss.get(f"ref_{c['id']}"), "params": ss.get(f"pr_{c['id']}"),
+        }) for c in ss.cards]
+        with st.spinner("Running selection…"):
+            res = run_selection(ss.records, pipeline, int(seed), run_ws, prefer_real=True)
+        ss.selected = [ss.records[i] for i in res["indices"]]
+        ss.result = {**res, "pipeline": pipeline, "planner": None, "num_total": len(ss.records)}
+    else:
+        exec_spec = make_planner_spec(include_key=True)
+        disp_spec = make_planner_spec(include_key=False)   # rendered config — no secret
+        has_key = bool((ss.get("planner_key") or "").strip() or os.environ.get("OPENAI_API_KEY"))
+        if stack_available() and has_key:
+            with st.spinner("LLM is planning & running the cascade…"):
+                try:
+                    indices, log = run_real(ss.records, [{"method": "default", "budget": 0.5}],
+                                            int(seed), run_ws, planner_spec=exec_spec)
+                    res = {"mode": "real", "indices": indices, "log": log, "note": ""}
+                except Exception as e:  # noqa: BLE001
+                    res = {"mode": "config", "indices": [], "log": [],
+                           "note": f"agentic run failed ({type(e).__name__}: {e}); "
+                                   "showing the config to run on a GPU host instead"}
+        else:
+            res = {"mode": "config", "indices": [], "log": [],
+                   "note": "Agentic execution needs the ML stack + a controller API key here — "
+                           "save the config below and run it on a GPU host."}
+        ss.selected = [ss.records[i] for i in res["indices"]] if res["mode"] == "real" else None
+        ss.result = {**res, "pipeline": [], "planner": disp_spec, "num_total": len(ss.records)}
 
 # ---- STEP 3: result ----
 if ss.result:
     res = ss.result
     st.subheader("3 · Result & download")
-    badge = st.success if res["mode"] == "real" else st.warning
-    badge(f"mode: **{res['mode']}** — kept {len(ss.selected)} / {res['num_total']} examples")
-    if res["note"]:
+    if res["mode"] == "config":
+        # Agentic run couldn't execute here (no ML stack / API key) — hand over the
+        # ready-to-run config instead, matching the demo's "reproduce on a GPU host".
         st.info(res["note"])
-
-    for i, s in enumerate(res["log"]):
-        cols = st.columns([0.5, 2, 2, 3, 1.4])
-        cols[0].markdown(f"<span class='op-badge'>#{i+1}</span>", unsafe_allow_html=True)
-        cols[1].markdown(f"**{s['name']}**")
-        cols[2].caption(f"method: {s['method']} · budget: {s.get('budget', '—')}")
-        cols[3].progress(min(1.0, s["kept"] / max(1, res["num_total"])))
-        cols[4].metric("kept", s["kept"], label_visibility="collapsed")
-
-    g1, g2 = st.columns(2)
-    with g1:
-        st.markdown("**Selected preview**")
-        st.dataframe(ss.selected[:8], use_container_width=True, hide_index=True)
-        st.download_button(
-            "⬇ Download selected dataset (.jsonl)",
-            data="\n".join(json.dumps(r, ensure_ascii=False) for r in ss.selected),
-            file_name=f"selected_{res['num_total']}to{len(ss.selected)}.jsonl",
-            mime="application/x-ndjson", type="primary")
-    with g2:
-        st.markdown("**Reproduce this run**")
+        st.markdown("**Run this on a GPU host**")
         st.caption("config.yaml")
-        st.code(render_config_yaml("custom", res["pipeline"]), language="yaml")
+        st.code(render_config_yaml("custom", res["pipeline"], planner=res.get("planner")), language="yaml")
         st.caption("CLI")
-        st.code(render_cli("custom", res["pipeline"]), language="bash")
+        st.code(render_cli("custom", res["pipeline"], planner=res.get("planner")), language="bash")
+    else:
+        badge = st.success if res["mode"] == "real" else st.warning
+        badge(f"mode: **{res['mode']}** — kept {len(ss.selected)} / {res['num_total']} examples")
+        if res["note"]:
+            st.info(res["note"])
+
+        for i, s in enumerate(res["log"]):
+            cols = st.columns([0.5, 2, 2, 3, 1.4])
+            cols[0].markdown(f"<span class='op-badge'>#{i+1}</span>", unsafe_allow_html=True)
+            cols[1].markdown(f"**{s['name']}**")
+            cols[2].caption(f"method: {s['method']} · budget: {s.get('budget', '—')}")
+            cols[3].progress(min(1.0, s["kept"] / max(1, res["num_total"])))
+            cols[4].metric("kept", s["kept"], label_visibility="collapsed")
+
+        g1, g2 = st.columns(2)
+        with g1:
+            st.markdown("**Selected preview**")
+            st.dataframe(ss.selected[:8], use_container_width=True, hide_index=True)
+            st.download_button(
+                "⬇ Download selected dataset (.jsonl)",
+                data="\n".join(json.dumps(r, ensure_ascii=False) for r in ss.selected),
+                file_name=f"selected_{res['num_total']}to{len(ss.selected)}.jsonl",
+                mime="application/x-ndjson", type="primary")
+        with g2:
+            st.markdown("**Reproduce this run**")
+            st.caption("config.yaml")
+            st.code(render_config_yaml("custom", res["pipeline"], planner=res.get("planner")), language="yaml")
+            st.caption("CLI")
+            st.code(render_cli("custom", res["pipeline"], planner=res.get("planner")), language="bash")
 
 # ---- STEP 4: train ----
 if ss.selected:

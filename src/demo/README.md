@@ -14,11 +14,18 @@ python3 -m streamlit run src/demo/streamlit_app.py
 
 1. **Upload** an instruction dataset (`.jsonl` / `.json`; `{instruction, input,
    output}`, chat `messages`, or `prompt/response` schemas auto-mapped).
-2. **Build a selection pipeline** of operator cards — per card:
-   **name · method · proxy model · budget · scorer · policy** (+ optional
-   `reference` and method knobs, e.g. `warmup_steps=100` → `selection.warmup_steps`).
-   Add/remove cards and reorder with the ▲/▼ buttons (the cascade runs top →
-   bottom, each stage filtering the previous survivors).
+2. **Orchestrate selection** — pick one of two modes (a radio at the top of
+   step 2):
+   - **Manual pipeline** — build a cascade of operator cards; per card:
+     **name · method · proxy model · budget · scorer · policy** (+ optional
+     `reference` and method knobs, e.g. `warmup_steps=100` → `selection.warmup_steps`).
+     Add/remove cards and reorder with the ▲/▼ buttons (the cascade runs top →
+     bottom, each stage filtering the previous survivors).
+   - **Agentic** — an **LLM controller** plans the cascade itself from the run's
+     live structural state (survivors, budget, history), under guardrails. Set the
+     controller model / `max_stages` / `min_keep` / `goal` (and optional
+     `base URL` / `API key`); this sets `cfg.pipeline_planner` (see
+     `planner.llm.LLMPlanner`).
 3. **Download** the distilled subset as `.jsonl`.
 4. **Fine-tune** end-to-end on the selected subset.
 
@@ -44,6 +51,13 @@ pins a policy in code (`adapt → reweight`, `greats → greats`) shows it read-
 
 Either way the result panel prints the exact `config.yaml` + CLI to reproduce
 the run on a GPU host.
+
+**Agentic mode** runs for real only when the ML stack **and** a controller API
+key (`OPENAI_API_KEY`, or one entered in the form) are both present — the LLM
+plans stages while the operators run on GPU. Without both, "Run selection" skips
+execution and hands back the ready-to-run `config.yaml` (with the
+`pipeline_planner` block) to run on a GPU host — the API key is never written into
+the rendered config.
 
 ## Optional: real drag-and-drop
 

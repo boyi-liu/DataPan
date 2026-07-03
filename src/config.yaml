@@ -31,9 +31,12 @@ lora:
 # ---- Dataset ----
 # `name` selects the module dataset/load_<name>.py, which builds
 # {data_dir}/<name>.jsonl on first use and then loads it. Available:
-#   alpaca   -> Stanford Alpaca 52k (Hub)
-#   wizardlm -> WizardLM Evol-Instruct (Hub)
-#   less     -> FLAN V2 + CoT + Dolly + OpenAssistant1 mixture (local Tulu files)
+#   alpaca      -> Stanford Alpaca 52k (Hub)
+#   wizardlm    -> WizardLM Evol-Instruct (Hub)
+#   less        -> FLAN V2 + CoT + Dolly + OpenAssistant1 mixture (local Tulu files)
+#   gsm8k       -> GSM8K grade-school math word problems (Hub)
+#   bioinstruct -> BioInstruct 25k biomedical instructions (Hub)
+#   dialogsum   -> DialogSum dialogue summarization (Hub)
 # Optional prep knobs (read when the cache is built), e.g. via -o or here:
 #   sample_percentage: 0.05      # fraction of each source to keep
 #   source: tatsu-lab/alpaca     # override the Hub id (alpaca / wizardlm)
@@ -74,6 +77,21 @@ dataset:
 #   python main.py --method less --budget 0.05
 #   python main.py --scorer bm25 --policy hard
 #   python main.py --budget 0.1                 # bare `default` operator
+# A `pipeline_planner` decides the cascade's stages. Omitted (or type: list) ->
+# the static `pipeline:` list below runs exactly as written. type: llm hands
+# orchestration to an LLM controller that CHOOSES each stage from live structural
+# state (survivors remaining, budget spent, operators already run -- no per-step
+# eval), subject to four guardrails: a hard step cap (max_stages), a budget floor
+# (min_keep), operator-name validation, and a decision log at
+# <output_dir>/planner_decisions.jsonl. The controller LLM is an OpenAI-compatible
+# endpoint (env OPENAI_API_KEY / OPENAI_BASE_URL), NOT the local model being tuned.
+# pipeline_planner:
+#   type: llm
+#   model: gpt-5-mini
+#   max_stages: 6
+#   min_keep: 0.01
+#   goal: "Select a small, high-quality subset for math reasoning."
+
 pipeline:
   - method: default
     budget: 0.05

@@ -17,6 +17,7 @@ import warnings
 
 from dataset import get_dataset
 from alg import get_selector
+from planner import build_planner
 from utils.model_utils import load_model_and_tokenizer
 from utils.options import Config, parse_args, _default_policy
 from utils.train_utils import set_seed, train as run_training
@@ -155,12 +156,14 @@ def _stage_cfg(base_cfg, stage):
 
 
 def run_pipeline(cfg, model, tokenizer, train_set, val_set):
-    """Run the ``cfg.pipeline`` cascade; return (indices, last_selector, log).
+    """Run the operator cascade; return (indices, last_selector, log).
 
+    Stages come from a :class:`planner.Planner` (default: replay ``cfg.pipeline``;
+    ``pipeline_planner.type: llm`` lets an LLM choose each stage from live state).
     ``indices`` are into the original ``train_set``. ``last_selector`` is the
     final stage's operator (whose ``make_trainer`` the final training may use).
     """
-    stages = cfg.pipeline or [{"method": "default"}]
+    planner = build_planner(cfg)
     top_name = cfg.model.name
     # Model cache: the top-level model stays resident (final training reuses it);
     # at most one *extra* model is held at a time so long chains don't OOM.
@@ -196,11 +199,23 @@ def run_pipeline(cfg, model, tokenizer, train_set, val_set):
             ref_cache[name] = data.get("validation") or data["train"]
         return ref_cache[name]
 
+    original_size = len(train_set)
     current = train_set
-    survivors = list(range(len(train_set)))  # positions in current -> original idx
+    survivors = list(range(original_size))  # positions in current -> original idx
     last_selector = None
     log = []
-    for i, stage in enumerate(stages):
+    stage_num = 0
+    while True:
+        state = {
+            "original_size": original_size,
+            "current_size": len(survivors),
+            "kept_fraction": len(survivors) / original_size if original_size else 0.0,
+            "history": log,
+        }
+        stage = planner.next_stage(state)
+        if stage is None:
+            break
+        stage_num += 1
         if stage.get("_resolved"):
             stage_cfg, model_i, tok_i, ref = cfg, model, tokenizer, val_set
             name = cfg.selection.method
@@ -218,7 +233,8 @@ def run_pipeline(cfg, model, tokenizer, train_set, val_set):
         last_selector = selector
         log.append({"name": name, "method": stage_cfg.selection.method,
                     "budget": stage_cfg.selection.budget, "kept": len(survivors)})
-        print(f"      [{i + 1}/{len(stages)}] {name}: kept {len(survivors)} examples")
+        pos = f"{stage_num}/{planner.total}" if planner.total else f"{stage_num}"
+        print(f"      [{pos}] {name}: kept {len(survivors)} examples")
 
     return sorted(survivors), last_selector, log
 
@@ -246,8 +262,11 @@ def main():
     print(f"      train={len(train_set)} | "
           f"validation={len(val_set) if val_set is not None else 0}")
 
-    stages = cfg.pipeline or []
-    print(f"[3/5] Selecting data: {len(stages)}-stage pipeline")
+    planner_type = (cfg.get("pipeline_planner") or {}).get("type") or "list"
+    if planner_type == "list":
+        print(f"[3/5] Selecting data: {len(cfg.pipeline or [])}-stage pipeline")
+    else:
+        print(f"[3/5] Selecting data: {planner_type}-planned pipeline (adaptive)")
     indices, last_selector, log = run_pipeline(cfg, model, tokenizer, train_set, val_set)
     selected = train_set.select(indices)
     out = _save_json(cfg, "selection.json", {
@@ -263,8 +282,10 @@ def main():
 
     print(f"[4/5] Fine-tuning on {len(selected)} selected examples")
     # The final stage's operator may inject a trainer (e.g. an online method like
-    # ADAPT ending the pipeline); otherwise fall back to the generic Trainer.
-    trainer = last_selector.make_trainer(cfg, model, tokenizer, selected, val_set)
+    # ADAPT ending the pipeline); otherwise fall back to the generic Trainer. An
+    # adaptive planner may also run zero stages (immediate stop) -> no selector.
+    trainer = (last_selector.make_trainer(cfg, model, tokenizer, selected, val_set)
+               if last_selector is not None else None)
     run_training(cfg, model, tokenizer, selected, val_set, trainer=trainer)
     print(f"      artifacts in {cfg.output_dir}")
 
@@ -273,7 +294,8 @@ def main():
         from utils.eval_utils import evaluate
         result = evaluate(cfg, model, tokenizer, known.benchmark, limit=known.eval_limit)
         _save_json(cfg, "eval.json", result)
-        print(f"      {known.benchmark}: accuracy={result['accuracy']:.4f} (n={result['n']})")
+        print(f"      {known.benchmark}: {result['metric']}={result['score']:.4f} "
+              f"(n={result['n']})")
     else:
         print("[5/5] No --benchmark given; done.")
 
