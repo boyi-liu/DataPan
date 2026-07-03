@@ -31,6 +31,7 @@ DEFAULT_CONFIG = os.path.join(os.path.dirname(__file__), os.pardir, "config.yaml
 #: composes a scorer + policy from config, so it needs a scorer to fall back to.
 DEFAULT_METHOD = "default"
 DEFAULT_SCORER = "bm25"
+DEFAULT_BUDGET = 0.05
 
 
 class Config(dict):
@@ -150,35 +151,70 @@ def _default_policy(method):
     return getattr(module, "DEFAULT_POLICY", None)
 
 
+def _apply_overrides(cfg, overrides):
+    """Apply ``-o KEY.PATH=VALUE`` generic overrides (the final say)."""
+    for item in overrides:
+        key, sep, raw = item.partition("=")
+        if not sep:
+            raise ValueError(f"Malformed override (expected KEY=VALUE): {item!r}")
+        cfg.set_path(key.strip(), _coerce(raw))
+
+
 def parse_args(argv=None):
-    # Phase 1: sniff --config/--method/--scorer/--policy without triggering help.
+    """Resolve config for a run, always ending with a ``cfg.pipeline`` stage list.
+
+    A run is a cascade of operators (see ``main.run_pipeline``). There are two
+    ways to populate ``cfg.pipeline``:
+
+      * **CLI shortcut** -- naming an operator (``--method``/``--scorer``/
+        ``--policy``) or a ``--budget`` builds a *single-stage* pipeline from the
+        fully-resolved ``selection.*`` config (so ``--warmup-steps`` etc. still
+        work). This overrides any ``pipeline:`` in the config file.
+      * **Config-driven** -- otherwise the config file's top-level ``pipeline:``
+        list drives the run; per-stage knobs come from each stage dict (see
+        ``main._stage_cfg``), not from method-specific CLI flags.
+    """
+    # Sniff the operator-defining flags without triggering help. Any of them ->
+    # the CLI shortcut (a one-stage pipeline built from selection.*).
     sniff = argparse.ArgumentParser(add_help=False)
     sniff.add_argument("--config", default=DEFAULT_CONFIG)
     sniff.add_argument("--method")
     sniff.add_argument("--scorer")
     sniff.add_argument("--policy")
+    sniff.add_argument("--budget", type=float)
     pre, _ = sniff.parse_known_args(argv)
     cfg = load_config(pre.config)
-    # 'default' is the modular selector (alg/default.py): it builds its scorer +
-    # policy from config, so omitting --method just runs it.
-    method = pre.method or cfg.selection.method or DEFAULT_METHOD
-    cfg.set_path("selection.method", method)
-    # User-chosen scorer / policy (explicit --flag > config.yaml); None == "unset".
-    user_scorer = pre.scorer or cfg.selection.scorer
-    user_policy = pre.policy or cfg.selection.policy
+    if not isinstance(cfg.get("selection"), Config):
+        cfg["selection"] = Config()  # internal per-stage namespace; not user-facing
+
+    single = bool(pre.method or pre.scorer or pre.policy or pre.budget is not None)
+
+    if not single:
+        # ---- Config-driven pipeline: the file's `pipeline:` list drives it. ----
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        for dest, value in vars(args).items():
+            if dest in ("config", "override") or value is None:
+                continue
+            cfg.set_path(dest, value)
+        _apply_overrides(cfg, args.override)
+        if not cfg.get("pipeline"):
+            cfg["pipeline"] = [{"method": DEFAULT_METHOD, "budget": DEFAULT_BUDGET}]
+        return cfg
+
+    # ---- CLI shortcut: resolve one operator into selection.* (as a 1-stage). ----
+    method = pre.method or DEFAULT_METHOD
+    user_scorer = pre.scorer or cfg.get_path("selection.scorer")
+    user_policy = pre.policy or cfg.get_path("selection.policy")
 
     if method == DEFAULT_METHOD:
-        # Only the 'default' selector composes scorer + policy from config. The
-        # scorer falls back to a built-in one so a bare `python main.py` runs;
-        # the policy falls back to 'hard'. Their plugin flags load from the
-        # resolved names below.
+        # The 'default' operator composes scorer + policy from config; both fall
+        # back to built-ins so `--budget X` alone still runs.
         scorer = user_scorer or DEFAULT_SCORER
         policy = user_policy or "hard"
     else:
         # A custom method defines its own scorer *and* policy, so a pinned scorer
-        # or policy is ignored -- warn rather than let it look applied. The policy
-        # is forced to the method's own default (e.g. ADAPT -> reweight, else
-        # 'hard'); choose method='default' to compose a scorer with a policy.
+        # or policy is ignored -- warn rather than let it look applied.
         ignored = []
         if user_scorer:
             ignored.append(f"scorer={user_scorer!r}")
@@ -186,46 +222,38 @@ def parse_args(argv=None):
             ignored.append(f"policy={user_policy!r}")
         if ignored:
             warnings.warn(
-                f"selection.method={method!r} is a custom selector that defines "
-                f"its own scorer and policy; the configured {', '.join(ignored)} "
-                f"will be ignored. Use method='default' to compose a scorer with "
-                f"a policy.",
+                f"method={method!r} is a custom selector that defines its own "
+                f"scorer and policy; the configured {', '.join(ignored)} will be "
+                f"ignored. Use method='default' to compose a scorer with a policy.",
                 stacklevel=2,
             )
         scorer = None  # custom methods hard-wire their own scorer
         policy = _default_policy(method) or "hard"
 
-    # Write the resolved values back so the plugin-arg loader, get_scorer() and
-    # get_policy() all see them.
+    cfg.set_path("selection.method", method)
     cfg.set_path("selection.scorer", scorer)
     cfg.set_path("selection.policy", policy)
 
-    # Phase 2: build the full parser and let the chosen algorithm + scorer +
-    # policy add their flags (defaults live in the plugin, so their dests always
-    # apply). The scorer's flags load for the modular selector; for a thin
-    # per-scorer alg they are re-exported via the method module instead.
+    # Let the chosen algorithm + scorer + policy register their CLI flags
+    # (defaults live in the plugin, so their dests always apply).
     parser = build_parser()
     plugin_dests = _add_plugin_args(parser, "alg", method)
     plugin_dests |= _add_plugin_args(parser, "scorer", scorer)
     plugin_dests |= _add_plugin_args(parser, "policy", policy)
     args = parser.parse_args(argv)
 
-    # Apply curated + plugin flags. Plugin flags always apply (defaults live in
-    # the plugin); curated flags only when explicitly set (default None).
-    # selection.scorer/policy are already fully resolved in Phase 1 (a custom
-    # method deliberately overrides what the user passed), so skip them here --
-    # otherwise the raw --scorer/--policy values would clobber that resolution.
+    # Plugin flags always apply; curated flags only when explicitly set. Skip
+    # selection.scorer/policy -- already resolved above (a custom method
+    # deliberately overrides what the user passed).
     for dest, value in vars(args).items():
         if dest in ("config", "override", "selection.scorer", "selection.policy"):
             continue
         if dest in plugin_dests or value is not None:
             cfg.set_path(dest, value)
+    _apply_overrides(cfg, args.override)
 
-    # Generic overrides have the final say.
-    for item in args.override:
-        key, sep, raw = item.partition("=")
-        if not sep:
-            raise ValueError(f"Malformed override (expected KEY=VALUE): {item!r}")
-        cfg.set_path(key.strip(), _coerce(raw))
-
+    if cfg.get_path("selection.budget") is None:
+        cfg.set_path("selection.budget", DEFAULT_BUDGET)
+    # One-stage pipeline that reuses the fully-resolved base config as-is.
+    cfg["pipeline"] = [{"_resolved": True}]
     return cfg

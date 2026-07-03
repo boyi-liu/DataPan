@@ -44,41 +44,50 @@ dataset:
   data_dir: ./data
   validation_split: 0.05
 
-# ---- Selection ----
-# Two ways to run, sharing one Scorer -> Policy -> Timing design:
+# ---- Pipeline (operator orchestration) ----
+# A run is a CASCADE OF OPERATORS: every method in alg/ (and every `default`
+# scorer+policy pairing) is one operator, chained so each stage filters the
+# previous stage's survivors. A single method is just a one-stage pipeline.
 #
-#   1. Default (config-only): the `default` method composes a `scorer` (axes ①②③,
-#      scorer/<scorer>.py) with a `policy` (axis ④) dynamically -- no glue code.
-#      It is the default `method`, so just set `scorer`/`policy` (or pass --scorer/
-#      --policy) and `--method` can be omitted:
-#        python main.py --scorer bm25 --policy hard
-#      Available scorers: bm25, embedding, ppl. Discover their knobs with
-#        python main.py --scorer <s> --policy <p> --help
+# Each stage overlays the base config for that operator only:
+#   method       -- which alg/<method>.py operator; omit -> `default`, which
+#                   composes a `scorer` (axes ①②③, scorer/<scorer>.py) with a
+#                   `policy` (axis ④, policy/<policy>.py). Available scorers:
+#                   bm25, embedding, ppl. Custom methods (less, ifd, greats,
+#                   adapt, miwv, random, ...) wire their own scorer AND policy,
+#                   so `scorer`/`policy` are ignored for them.
+#   scorer/policy-- `default` only. policy maps scores -> a subset/weights:
+#                   hard (top-k, default), diversity (k-center coverage; needs a
+#                   feature-exposing scorer), reweight (soft weights; ADAPT's gate).
+#   model        -- model.name for this stage (loaded lazily & cached; only one
+#                   extra model resident at a time, so long chains don't OOM).
+#   reference    -- dataset name used as this stage's val_dataset (② comparison
+#                   target, e.g. LESS's influence anchor); null reuses the
+#                   top-level validation split.
+#   budget       -- fraction (<=1) or int count kept from the CURRENT survivors
+#                   (cascade): two 0.5 stages keep 0.5 x 0.5 = 25% of the original.
+#   <hyper-param> -- any OTHER key is a method knob, i.e. shorthand for
+#                   selection.<key>: `warmup_steps: 100` == `--warmup-steps 100`.
+#                   List a method's knobs with e.g. `--method less --help`.
 #
-#   2. Custom (fine-grained): set `method` to a hand-written alg/<method>.py
-#      (less, ifd, greats, adapt, miwv, random, ...) that wires its own scorer
-#      and policy -- use when name + policy isn't enough (multiple scorers, a
-#      custom reweighting trainer, ...). Its knobs come from alg/<method>.add_args():
-#        python main.py --method less --help
-#      Such a method defines its own scorer AND policy, so both `scorer` and
-#      `policy` (and --scorer/--policy) are ignored once `method` is not `default`
-#      -- a warning is printed. The method's policy is its module-level
-#      DEFAULT_POLICY (e.g. adapt -> reweight, greats -> greats), else hard.
-#
-# `scorer` and `policy` therefore only take effect for the `default` method:
-# `policy` (the ④ axis) maps scores to per-sample weights, blind to what the
-# score means. It selects policy/<policy>.py:
-#   hard       -> top-k mask (default; diversity-blind, the original behavior)
-#   diversity  -> k-center coverage over example features (needs a scorer that
-#                 exposes features: embedding, miwv)
-#   reweight   -> soft continuous weights (online; ADAPT's gate). Selection is
-#                 the binary special case of reweighting -- same `weights()` map.
-# For the `default` method, `policy: null` -> hard and `scorer: null` -> bm25.
-selection:
-  method: default
-  budget: 0.05                # fraction (<=1) of train set to keep, or an int count
-  scorer: null                # `default` method only: picks scorer/<scorer>.py (null -> bm25)
-  policy: null
+# The CLI is a shortcut for a ONE-stage pipeline and overrides this list:
+#   python main.py --method less --budget 0.05
+#   python main.py --scorer bm25 --policy hard
+#   python main.py --budget 0.1                 # bare `default` operator
+pipeline:
+  - method: default
+    budget: 0.05
+  # A multi-stage example (coarse cheap filter, then precise filter on survivors):
+  # - name: coarse-ppl
+  #   method: ppl
+  #   model: Qwen/Qwen2.5-0.5B-Instruct
+  #   budget: 0.5
+  # - name: precise-less
+  #   method: less
+  #   model: Qwen/Qwen2.5-3B-Instruct
+  #   reference: bbh
+  #   budget: 0.1
+  #   warmup_steps: 100         # method knob -> selection.warmup_steps
 
 # ---- Training (final run on the selected subset) ----
 train:

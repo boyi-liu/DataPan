@@ -78,7 +78,7 @@ python main.py --method less --help
 
 ---
 
-## Two Ways to Use It
+## Three Ways to Use It
 
 ### 1. Modular composition — pick a scorer + a policy (no code)
 
@@ -98,15 +98,19 @@ python main.py --scorer ppl --policy hard --budget 1000
 python main.py --scorer embedding --policy diversity
 ```
 
-Or set it once in `config.yaml`:
+Or set it once in `config.yaml`. A run is a **pipeline** — a cascade of
+operators — and a single method is just a one-stage pipeline:
 
 ```yaml
-selection:
-  method: default       # the modular selector; alg/default.py
-  scorer: embedding     # scorer/<scorer>.py  (null -> bm25)
-  policy: diversity      # policy/<policy>.py
-  budget: 0.05
+pipeline:
+  - method: default       # the modular selector; alg/default.py
+    scorer: embedding     # scorer/<scorer>.py  (omit -> bm25)
+    policy: diversity     # policy/<policy>.py
+    budget: 0.05
 ```
+
+The CLI (`--method` / `--scorer` / `--policy` / `--budget`) is a shortcut that
+builds a one-stage pipeline and overrides this list.
 
 `--scorer` selects `scorer/<name>.py`, `--policy` selects `policy/<name>.py`, and
 both contribute their own tunables (`--bm25-k1`, etc.). Note that interaction-aware
@@ -156,6 +160,99 @@ Expose method hyper-parameters by adding an `add_args(parser)` function (its
 `dest` is the dotted config path it sets, e.g. `selection.warmup_steps`). The
 published methods all live in `alg/` this way and are the best reference — see
 `alg/less.py` (offline, gradient influence) and `alg/adapt.py` (online reweighting).
+
+### 3. Orchestrate — chain operators into a pipeline
+
+Every method above is an **operator**, and a run is a *cascade* of them: list
+stages under `pipeline:` and each stage filters the previous stage's survivors.
+A single method is just a one-stage pipeline — so this is the only execution
+model; the `--method`/`--scorer`/`--policy`/`--budget` CLI is a shortcut that
+builds a one-stage pipeline and overrides the `pipeline:` list.
+
+```yaml
+pipeline:
+  - name: coarse-ppl        # cheap perplexity pass on a small model
+    method: ppl
+    model: Qwen/Qwen2.5-0.5B-Instruct
+    budget: 0.5             # keep the top 50% of the full set
+  - name: precise-less      # precise influence pass on the survivors
+    method: less
+    model: Qwen/Qwen2.5-3B-Instruct
+    reference: bbh          # target set for LESS's influence match
+    budget: 0.1             # keep the top 10% of the survivors -> 5% overall
+    warmup_steps: 100       # a LESS knob (see below)
+```
+
+Each stage overlays the base config for that operator only. Stage keys:
+
+| Key | Applies to | Meaning |
+|-----|-----------|---------|
+| `method` | all | Which operator (`alg/<method>.py`); omit → `default`. |
+| `scorer` / `policy` | **`default` only** | Compose the `default` operator (`scorer/<s>.py`, `policy/<p>.py`). **Ignored for concrete methods** — they wire their own in code (a warning is printed if you set them, and the policy is forced to the method's `DEFAULT_POLICY`, e.g. `adapt → reweight`). |
+| `model` | all | `model.name` for this stage's *selection* pass (see notes below). |
+| `reference` | all | Dataset name loaded as this stage's `val_dataset` (the ② target/anchor, e.g. LESS's influence set). `null` reuses the top-level validation split. |
+| `budget` | all | Fraction (`≤1`) or int count kept from the **current** survivors. |
+| *any other key* | all | A **method hyper-parameter** — shorthand for `selection.<key>`. `warmup_steps: 100` in a stage is exactly `--warmup-steps 100` on the CLI. List a method's knobs with e.g. `--method less --help` (or read the `dest=` in its `add_args`). |
+
+**Budgets compound** down the cascade: `0.5 → 0.1` keeps `0.5 × 0.1 = 5%` of the
+original set. Orchestration lives in `main.run_pipeline`.
+
+**Notes on `model`:**
+
+- A stage's `model:` sets **only `model.name`**. Every other `model.*` field
+  (`torch_dtype`, `max_length`, `load_in_8bit`, …) and all of `lora.*` always
+  come from the top-level config.
+- Per-stage models are used **only for selection/scoring**. The **final
+  fine-tuning always uses the top-level `model.name`** (loaded once), regardless
+  of what any stage used. So a stage can score influence with a 3B model while
+  the run still fine-tunes the top-level model.
+- Models are loaded lazily and cached; the top-level model stays resident and at
+  most **one extra** stage model is held at a time, so long chains don't OOM.
+
+**Final trainer:** offline stages return a subset and the run fine-tunes with the
+generic Trainer. If the **last** stage's operator injects a trainer (an online
+method like `adapt`), the run uses that instead — so a pipeline can end on
+per-step reweighting.
+
+---
+
+## Demo — DataPan UI (Streamlit)
+
+A single-file Streamlit app that builds and runs pipelines visually — same engine
+as the CLI, no config editing. Everything lives in
+[`src/demo/streamlit_app.py`](src/demo/streamlit_app.py); see
+[`src/demo/README.md`](src/demo/README.md) for details.
+
+```bash
+python3 -m streamlit run src/demo/streamlit_app.py
+```
+
+Flow (top → bottom of the page):
+
+1. **Upload** an instruction dataset (`.jsonl` / `.json`; `{instruction, input,
+   output}`, chat `messages`, or `prompt/response` schemas are auto-mapped).
+2. **Build a pipeline** as a stack of operator **cards** — each card is one stage
+   (**name · method · proxy model · budget · scorer · policy**, plus optional
+   `reference` and method knobs). Add/remove cards and reorder with ▲/▼; the cascade
+   runs top → bottom, each stage filtering the previous stage's survivors — the
+   visual counterpart of the `pipeline:` list above.
+3. **Run selection**, then **download** the distilled subset as `.jsonl`, or
+   **fine-tune** end-to-end on it.
+
+A few things mirror the framework semantics described above:
+
+- **scorer / policy locking** — a card's `scorer`/`policy` are editable **only
+  when `method: default`** (the one operator that composes them). Concrete
+  methods grey them out, and a method that pins a policy in code (`adapt →
+  reweight`, `greats → greats`) shows it read-only — exactly the gating in
+  `main._stage_cfg`.
+- **real vs. simulated** — with PyTorch + transformers importable, "Run
+  selection" runs the genuine cascade via `main.run_pipeline` (badge: **real**,
+  uploaded data routed through `dataset/load_custom.py`). Otherwise it falls back
+  to a seeded **budget-cascade simulation** — a preview of stage *sizes and
+  wiring*, not of *which* examples a model-based scorer would pick.
+- Either way, the result panel prints the exact `config.yaml` + CLI to reproduce
+  the run on a GPU host.
 
 ---
 
