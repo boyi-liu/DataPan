@@ -1,6 +1,6 @@
 # DataPan: Agentic Data Selection for LLM Finetuning
 
-<img src="./assets/datapan.png" alt="Logo" width="50%">
+<img src="./assets/datapan.png" alt="Logo" width="70%">
 
 **DataPan** pans for gold in your data — it sifts large instruction-tuning corpora down to the examples that actually make a LLM better. 
 Not all training data is worth its weight: some examples teach the model nothing, some even hurt. 
@@ -99,7 +99,7 @@ python main.py --method less --help
 
 ## Four Ways to Use It
 
-<img src="./assets/step.png" alt="Logo" width="50%">
+<img src="./assets/step.png" alt="Logo" width="70%">
 
 Modes 1–3 decide the stages **up front** (a fixed list, even if it's a single
 stage); mode 4 lets an **LLM decide them at run time**.
