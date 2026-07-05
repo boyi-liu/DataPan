@@ -1,6 +1,6 @@
 # DataPan: Agentic Data Selection for LLM Finetuning
 
-![Logo](./assets/datapan.png)
+<img src="./assets/datapan.png" alt="Logo" width="50%">
 
 **DataPan** pans for gold in your data — it sifts large instruction-tuning corpora down to the examples that actually make a LLM better. 
 Not all training data is worth its weight: some examples teach the model nothing, some even hurt. 
@@ -99,50 +99,12 @@ python main.py --method less --help
 
 ## Four Ways to Use It
 
+<img src="./assets/step.png" alt="Logo" width="50%">
+
 Modes 1–3 decide the stages **up front** (a fixed list, even if it's a single
 stage); mode 4 lets an **LLM decide them at run time**.
 
-### 1. Modular composition — pick a scorer + a policy (no code)
-
-The `default` selector composes **any** scorer with **any** policy straight from
-the config / CLI — it covers the "score the whole set once, then take a subset"
-case with zero glue code. It is the **default method**, so `--method` can be
-omitted; just choose a scorer and a policy:
-
-```bash
-# BM25 lexical relevance, plain top-k
-python main.py --scorer bm25 --policy hard --budget 0.05
-
-# perplexity signal, plain top-k
-python main.py --scorer ppl --policy hard --budget 1000
-
-# embedding similarity to a validation anchor, kept diverse via k-center coverage
-python main.py --scorer embedding --policy diversity
-```
-
-Or set it once in `config.yaml`. A run is a **pipeline** — a cascade of
-operators — and a single method is just a one-stage pipeline:
-
-```yaml
-pipeline:
-  - method: default       # the modular selector; alg/default.py
-    scorer: embedding     # scorer/<scorer>.py  (omit -> bm25)
-    policy: diversity     # policy/<policy>.py
-    budget: 0.05
-```
-
-The CLI (`--method` / `--scorer` / `--policy` / `--budget`) is a shortcut that
-builds a one-stage pipeline and overrides this list.
-
-`--scorer` selects `scorer/<name>.py`, `--policy` selects `policy/<name>.py`, and
-both contribute their own tunables (`--bm25-k1`, etc.). Note that interaction-aware
-policies like `diversity` need a scorer that exposes `features` (e.g. `embedding`).
-
-> **`--scorer` / `--policy` only apply to the `default` method.** A custom method
-> (mode 2 below) wires its own scorer *and* policy, so passing either alongside
-> `--method <name>` is ignored and prints a warning.
-
-### 2. DIY — write your own algorithm
+### 1. DIY — write your own algorithm
 
 When "one scorer → one policy" isn't enough — multiple scorers or gradient
 plumbing — drop a file in
@@ -179,6 +141,46 @@ Expose method hyper-parameters by adding an `add_args(parser)` function (its
 `dest` is the dotted config path it sets, e.g. `selection.warmup_steps`). The
 published methods all live in `alg/` this way and are the best reference — see
 `alg/less.py` (offline, gradient influence) and `alg/ifd.py` (self-guided difficulty).
+
+### 2. Modular composition — pick a scorer + a policy (no code)
+
+The `default` selector composes **any** scorer with **any** policy straight from
+the config / CLI — it covers the "score the whole set once, then take a subset"
+case with zero glue code. It is the **default method**, so `--method` can be
+omitted; just choose a scorer and a policy:
+
+```bash
+# BM25 lexical relevance, plain top-k
+python main.py --scorer bm25 --policy hard --budget 0.05
+
+# perplexity signal, plain top-k
+python main.py --scorer ppl --policy hard --budget 1000
+
+# embedding similarity to a validation anchor, kept diverse via k-center coverage
+python main.py --scorer embedding --policy diversity
+```
+
+Or set it once in `config.yaml`. A run is a **pipeline** — a cascade of
+operators — and a single method is just a one-stage pipeline:
+
+```yaml
+pipeline:
+  - method: default       # the modular selector; alg/default.py
+    scorer: embedding     # scorer/<scorer>.py  (omit -> bm25)
+    policy: diversity     # policy/<policy>.py
+    budget: 0.05
+```
+
+The CLI (`--method` / `--scorer` / `--policy` / `--budget`) is a shortcut that
+builds a one-stage pipeline and overrides this list.
+
+`--scorer` selects `scorer/<name>.py`, `--policy` selects `policy/<name>.py`, and
+both contribute their own tunables (`--bm25-k1`, etc.). Note that interaction-aware
+policies like `diversity` need a scorer that exposes `features` (e.g. `embedding`).
+
+> **`--scorer` / `--policy` only apply to the `default` method.** A custom method
+> (mode 1 above) wires its own scorer *and* policy, so passing either alongside
+> `--method <name>` is ignored and prints a warning.
 
 ### 3. Orchestrate — chain operators into a pipeline
 
