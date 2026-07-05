@@ -7,21 +7,13 @@ becomes a weighting of the examples.
 
 The single primitive is :meth:`weights`: ``scores -> wᵢ >= 0``.
 
-  * **Hard selection** emits a ``{0, 1}`` mask -- keep or drop.
-  * **Soft reweighting** emits continuous weights -- a per-sample learning-rate
-    multiplier, nothing dropped.
+  * **Hard selection** (``hard``) emits a ``{0, 1}`` top-k mask -- keep or drop.
+  * **Coverage** (``diversity``) emits a ``{0, 1}`` mask too, but greedily
+    chooses a maximally-spread subset from per-example features rather than the
+    plain top-k.
 
-Selection is therefore the *binary special case* of reweighting, and both live
-behind one method. The primitive is also **scope-agnostic**: ``scores`` may cover
-the whole dataset (offline) or a single minibatch (online) -- the ⑤ Timing axis
-decides the scope and what happens to the weights, not the policy:
-
-  * **Offline** (``select``): weigh the whole set once; the subset is the
-    positively-weighted indices. The generic Trainer can't consume soft weights,
-    so offline collapses to the binary case.
-  * **Online** (in the training loop): weigh the current batch each step and
-    apply the weights to the per-sample loss -- reweighting *or* in-batch
-    selection, depending only on the policy.
+The subset is the positively-weighted indices (:meth:`select`), which the
+generic trainer then fine-tunes on.
 
 ``cfg.selection.policy`` chooses one; ``policy/<name>.py`` defines a ``Policy``.
 Score convention: **higher == more valuable** (selectors that prefer low values
@@ -37,8 +29,8 @@ class BasePolicy(ABC):
     """Maps per-example scores (and optional features) to per-example weights."""
 
     #: Whether :meth:`weights` requires per-example ``features``. Score-only
-    #: policies (hard filtering, soft reweighting) leave this False; coverage /
-    #: submodular policies that reason about sample interactions set it True.
+    #: policies (hard top-k) leave this False; coverage / submodular policies
+    #: that reason about sample interactions (``diversity``) set it True.
     needs_features = False
 
     def __init__(self, cfg):
@@ -48,16 +40,14 @@ class BasePolicy(ABC):
     def weights(self, scores, features=None):
         """Return non-negative per-sample weights, one per entry of ``scores``.
 
-        Hard policies emit a ``{0, 1}`` numpy mask; soft policies emit continuous
-        weights. ``features`` is an optional ``(N, d)`` array some policies need.
-        Works whether ``scores`` is a whole dataset (offline) or a batch (online).
+        Policies emit a ``{0, 1}`` keep/drop mask. ``features`` is an optional
+        ``(N, d)`` array some policies (e.g. ``diversity``) need.
         """
 
     def select(self, scores, features=None):
-        """Offline subset: the positively-weighted indices, sorted.
+        """The selected subset: the positively-weighted indices, sorted.
 
-        Derived from :meth:`weights`, so every policy yields a subset for free --
-        for soft policies that simply means "everything with weight > 0".
+        Derived from :meth:`weights`, so every policy yields a subset for free.
         """
         w = np.asarray(self.weights(scores, features=features), dtype=np.float64)
         return sorted(int(i) for i in np.flatnonzero(w > 0))
@@ -65,9 +55,8 @@ class BasePolicy(ABC):
     def _budget_to_k(self, n):
         """Resolve ``cfg.selection.budget`` into an absolute count for ``n`` items.
 
-        A budget ``<= 1`` is read as a fraction of ``n`` (of the dataset offline,
-        of the batch online); anything larger is an absolute count. Clamped to
-        ``[1, n]``.
+        A budget ``<= 1`` is read as a fraction of ``n``; anything larger is an
+        absolute count. Clamped to ``[1, n]``.
         """
         budget = self.cfg.selection.budget
         k = int(round(budget * n)) if budget <= 1 else int(budget)

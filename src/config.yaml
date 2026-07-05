@@ -56,12 +56,12 @@ dataset:
 #   method       -- which alg/<method>.py operator; omit -> `default`, which
 #                   composes a `scorer` (axes ①②③, scorer/<scorer>.py) with a
 #                   `policy` (axis ④, policy/<policy>.py). Available scorers:
-#                   bm25, embedding, ppl. Custom methods (less, ifd, greats,
-#                   adapt, miwv, random, ...) wire their own scorer AND policy,
+#                   bm25, embedding, ppl. Custom methods (less, ifd, miwv,
+#                   random, ...) wire their own scorer AND policy,
 #                   so `scorer`/`policy` are ignored for them.
-#   scorer/policy-- `default` only. policy maps scores -> a subset/weights:
+#   scorer/policy-- `default` only. policy maps scores -> a subset:
 #                   hard (top-k, default), diversity (k-center coverage; needs a
-#                   feature-exposing scorer), reweight (soft weights; ADAPT's gate).
+#                   feature-exposing scorer).
 #   model        -- model.name for this stage (loaded lazily & cached; only one
 #                   extra model resident at a time, so long chains don't OOM).
 #   reference    -- dataset name used as this stage's val_dataset (② comparison

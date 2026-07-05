@@ -1,9 +1,7 @@
 """Hard top-k filtering -- the ④ baseline (binary weights).
 
 Rank by score, weight the highest ``k`` examples 1 and the rest 0. Per-sample
-and diversity-blind. As an *offline* policy the derived ``select`` returns the
-top-k indices; as an *online* policy the same mask, applied per batch, is
-in-batch selection -- the binary end of the reweighting spectrum.
+and diversity-blind; the derived ``select`` returns the top-k indices.
 """
 
 import numpy as np

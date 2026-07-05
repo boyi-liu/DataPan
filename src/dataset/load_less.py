@@ -4,10 +4,8 @@ Reproduces the FLAN V2 + CoT + Dolly + OpenAssistant1 training pool used by
 
   * LESS: Selecting Influential Data for Targeted Instruction Tuning
     (Xia et al., 2024)
-  * Rethinking Data Curation in LLM Training: Online Reweighting Offers
-    Better Generalization than Offline Methods
 
-Both build on the open-instruct / Tulu pre-processing, where each source is a
+It builds on the open-instruct / Tulu pre-processing, where each source is a
 uniform ``messages`` record::
 
     {"dataset": "flan_v2", "id": "flan_v2_42",

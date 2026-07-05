@@ -53,7 +53,7 @@ MODEL_SUGGESTIONS = [
     "meta-llama/Llama-3.2-3B-Instruct",
 ]
 SCORERS = ["bm25", "embedding", "ppl"]
-POLICIES = ["hard", "diversity", "reweight", "greats"]
+POLICIES = ["hard", "diversity"]
 # method -> (composes_scorer_policy, default_policy_or_None)
 METHODS = {
     "default":   (True,  None),
@@ -63,8 +63,6 @@ METHODS = {
     "embedding": (False, None),
     "less":      (False, "hard"),
     "ifd":       (False, "hard"),
-    "greats":    (False, "greats"),
-    "adapt":     (False, "reweight"),
     "miwv":      (False, "hard"),
 }
 METHOD_NAMES = list(METHODS)
@@ -563,19 +561,34 @@ if ss.result:
 # ---- STEP 4: train ----
 if ss.selected:
     st.subheader("4 · End-to-end fine-tuning")
+    st.caption("`select`, `train` and `eval` are fully decoupled — each runs on its own "
+               "with `--stage` and hands artifacts to the next through `--output-dir`.")
     t = st.columns([2, 1, 1, 1])
     tmodel = t[0].selectbox("base model", MODEL_SUGGESTIONS)
     tepochs = t[1].number_input("epochs", value=3, min_value=1)
     tbatch = t[2].number_input("batch size", value=4, min_value=1)
     tlr = t[3].text_input("learning rate", value="2e-5")
-    cli = (f"python main.py --dataset custom --model {tmodel} --epochs {tepochs} "
-           f"--batch-size {tbatch} --lr {tlr} -o dataset.data_files=./selected.jsonl")
+    tbench = t[0].selectbox("eval benchmark", ["(none)", "gsm8k", "dialogsum"])
+    # The exported selected.jsonl is *already* the curated subset, so the select
+    # stage keeps all of it (--method random --budget 1.0) rather than filtering
+    # again. train then reads that saved subset; eval reads the trained model.
+    common = f"--output-dir ./run --dataset custom -o dataset.data_files=./selected.jsonl"
+    lines = [
+        f"python main.py --stage select {common} --method random --budget 1.0",
+        f"python main.py --stage train  {common} --model {tmodel} "
+        f"--epochs {tepochs} --batch-size {tbatch} --lr {tlr}",
+    ]
+    if tbench != "(none)":
+        lines.append(f"python main.py --stage eval   {common} --benchmark {tbench}")
+    cli = "\n".join(lines)
     if st.button("🚀 Start training"):
         n_sel = len(ss.selected)
         if stack_available():
             st.info(f"Ready to fine-tune **{n_sel}** selected examples with `{tmodel}`. "
-                    "Real multi-billion-param training is a long GPU job — launch the command below.")
+                    "Real multi-billion-param training is a long GPU job — launch the commands below.")
         else:
             st.warning("ML stack (transformers) not installed here. The selected examples are "
-                       "ready — run the command below on a machine with GPUs + transformers.")
+                       "ready — run the commands below on a machine with GPUs + transformers.")
         st.code(cli, language="bash")
+        st.caption("Run the stages in order against the same `--output-dir`; each reads the "
+                   "previous stage's output (subset → model → metrics) from there.")

@@ -11,18 +11,28 @@ method as a monolithic black box, DataPan factors data selection into a small se
 of orthogonal, swappable pieces — so you can recombine published methods from a
 config file, or assemble entirely new ones, without rewriting the pipeline.
 
-The end-to-end flow is always the same:
-
-```
-parse args → load model+tokenizer → load dataset → select subset
-           → (optionally) fine-tune → (optionally) evaluate a benchmark
-```
+**The three phases — `select`, `train`, `eval` — are fully decoupled and run one
+at a time** via `--stage`. Each stage force-saves its output and force-loads the
+previous stage's output, communicating only through artifacts under
+`--output-dir`, so a full run is three separate invocations:
 
 ```bash
-python main.py --scorer embedding --policy diversity --budget 0.05   # default method
-python main.py --method less --budget 0.05 --benchmark gsm8k
-python main.py --method random --no-train          # baseline, selection only
+python main.py --stage select --dataset alpaca --method less --budget 0.05
+python main.py --stage train                                   # fine-tune the saved subset
+python main.py --stage eval  --benchmark gsm8k --eval-limit 200
 ```
+
+What each stage reads and writes (all under `--output-dir`):
+
+| Stage | Reads | Writes |
+|-------|-------|--------|
+| `select` | the dataset (via `--dataset`) | `selected_dataset/` + `val_dataset/` (HF datasets) and `selection.json` (provenance) |
+| `train` | `selected_dataset/` (never re-touches the raw dataset) | the fine-tuned model checkpoint at the dir root |
+| `eval` | the fine-tuned model (`--benchmark` required) | `eval.json` (metrics) |
+
+Point every invocation of one run at the **same `--output-dir`** and pass the
+same `--config`/method flags (config stays the source of truth; only data and
+the model flow through disk).
 
 ### Static → manual → agentic
 
@@ -45,15 +55,14 @@ operators already used) and orchestrates the cascade itself. See
 
 ## Modular Design
 
-We decompose *"which data is worth training on"* into three independent axes.
+We decompose *"which data is worth training on"* into two independent axes.
 Each axis is a directory of interchangeable plugins; a run is just a choice of
 one plugin per axis.
 
 | Axis | Question it answers | Lives in | Plugins |
 |------|--------------------|----------|---------|
 | **Scorer** | What makes an example valuable? (signal × target × model) | `src/scorer/` | `bm25`, `embedding`, `ppl` |
-| **Policy** | How do per-example scores become a subset / weights? | `src/policy/` | `hard`, `diversity`, `reweight`, `greats` |
-| **Timing** | *When* does selection run? | (selector) | offline subset · online per-step |
+| **Policy** | How do per-example scores become a subset? | `src/policy/` | `hard`, `diversity` |
 
 - A **Scorer** maps a dataset to per-example scores, `score(train, val) -> (scores, features)`,
   following the convention *higher == more valuable*. It fuses the three things
@@ -62,22 +71,15 @@ one plugin per axis.
   anchor, the corpus itself, or nothing), and the **scoring model** (none, the
   frozen base model, a LoRA influence model…).
 - A **Policy** is blind to *what* a score means; it only turns a vector of scores
-  (and optional features) into per-sample weights `wᵢ ≥ 0`. **Hard** selection
-  (`{0,1}` top-k mask) and **soft** reweighting (continuous weights) are the two
-  ends of one primitive — selection is just the binary special case.
-- **Timing** is owned by the selector: *offline* methods score once and hand a
-  subset to the generic trainer; *online* methods (ADAPT, GREATS) override
-  `make_trainer` to score and reweight **each minibatch** inside the training loop.
-
-This is why two methods that look unrelated on paper often share machinery here:
-e.g. ADAPT's online reweighting is just `reweight` policy on the online timing,
-and GREATS is the gradient-based, diversity-aware sibling of ADAPT.
+  (and optional features) into a selected subset. **Hard** selection (`{0,1}`
+  top-k mask) is the baseline; **diversity** (coverage) instead picks a
+  maximally-spread subset from per-example features.
 
 ```
 src/
 ├── scorer/   # ①②③  what defines value   → get_scorer(cfg, model, tokenizer)
-├── policy/   # ④     scores → subset/weights → get_policy(cfg)
-├── alg/      # ⑤     selectors: glue scorer+policy, decide timing → get_selector(...)
+├── policy/   # ④     scores → subset      → get_policy(cfg)
+├── alg/      #       selectors: glue scorer+policy → get_selector(...)
 ├── dataset/  #       loaders: dataset/load_<name>.py → get_dataset(cfg, tokenizer)
 └── main.py   #       the pipeline
 ```
@@ -142,8 +144,8 @@ policies like `diversity` need a scorer that exposes `features` (e.g. `embedding
 
 ### 2. DIY — write your own algorithm
 
-When "one scorer → one policy" isn't enough — multiple scorers, gradient
-plumbing, a custom reweighting trainer, online timing — drop a file in
+When "one scorer → one policy" isn't enough — multiple scorers or gradient
+plumbing — drop a file in
 `src/alg/<name>.py` that defines a `Selector(BaseSelector)`. You wire the scorer
 and policy **in code** by importing the classes you want directly — exactly as
 the scorer is imported — so the dependencies are explicit (`get_scorer`/
@@ -167,19 +169,16 @@ class Selector(BaseSelector):
     def select(self, train_dataset, val_dataset=None):
         scores, features = self.scorer.score(train_dataset, val_dataset)
         return self.apply_policy(scores, features=features)
-
-    # optional: override for online per-step reweighting instead of an offline subset
-    # def make_trainer(self, cfg, model, tokenizer, train_dataset, val_dataset): ...
 ```
 
 Run it with `--method my_method`. Because the method owns its wiring, the CLI
 `--scorer`/`--policy` don't reach it — the scorer and policy are whatever you
-imported. If your policy exposes tunables (e.g. `diversity`, `reweight`), declare
+imported. If your policy exposes tunables (e.g. `diversity`), declare
 a module-level `DEFAULT_POLICY` matching the import so its `add_args` flags load.
 Expose method hyper-parameters by adding an `add_args(parser)` function (its
 `dest` is the dotted config path it sets, e.g. `selection.warmup_steps`). The
 published methods all live in `alg/` this way and are the best reference — see
-`alg/less.py` (offline, gradient influence) and `alg/adapt.py` (online reweighting).
+`alg/less.py` (offline, gradient influence) and `alg/ifd.py` (self-guided difficulty).
 
 ### 3. Orchestrate — chain operators into a pipeline
 
@@ -208,7 +207,7 @@ Each stage overlays the base config for that operator only. Stage keys:
 | Key | Applies to | Meaning |
 |-----|-----------|---------|
 | `method` | all | Which operator (`alg/<method>.py`); omit → `default`. |
-| `scorer` / `policy` | **`default` only** | Compose the `default` operator (`scorer/<s>.py`, `policy/<p>.py`). **Ignored for concrete methods** — they wire their own in code (a warning is printed if you set them, and the policy is forced to the method's `DEFAULT_POLICY`, e.g. `adapt → reweight`). |
+| `scorer` / `policy` | **`default` only** | Compose the `default` operator (`scorer/<s>.py`, `policy/<p>.py`). **Ignored for concrete methods** — they wire their own in code (a warning is printed if you set them, and the policy is forced to the method's `DEFAULT_POLICY`, else `hard`). |
 | `model` | all | `model.name` for this stage's *selection* pass (see notes below). |
 | `reference` | all | Dataset name loaded as this stage's `val_dataset` (the ② target/anchor, e.g. LESS's influence set). `null` reuses the top-level validation split. |
 | `budget` | all | Fraction (`≤1`) or int count kept from the **current** survivors. |
@@ -229,10 +228,8 @@ original set. Orchestration lives in `main.run_pipeline`.
 - Models are loaded lazily and cached; the top-level model stays resident and at
   most **one extra** stage model is held at a time, so long chains don't OOM.
 
-**Final trainer:** offline stages return a subset and the run fine-tunes with the
-generic Trainer. If the **last** stage's operator injects a trainer (an online
-method like `adapt`), the run uses that instead — so a pipeline can end on
-per-step reweighting.
+**Final trainer:** every stage returns a subset, and the separate `--stage
+train` fine-tunes the final survivors with the generic Trainer.
 
 ### 4. Agentic — let an LLM plan the cascade
 
@@ -312,9 +309,8 @@ A few things mirror the framework semantics described above:
 
 - **scorer / policy locking** — a card's `scorer`/`policy` are editable **only
   when `method: default`** (the one operator that composes them). Concrete
-  methods grey them out, and a method that pins a policy in code (`adapt →
-  reweight`, `greats → greats`) shows it read-only — exactly the gating in
-  `main._stage_cfg`.
+  methods grey them out and show their fixed policy (`hard`) read-only — exactly
+  the gating in `main._stage_cfg`.
 - **real vs. simulated** — with PyTorch + transformers importable, "Run
   selection" runs the genuine cascade via `main.run_pipeline` (badge: **real**,
   uploaded data routed through `dataset/load_custom.py`). Otherwise it falls back
@@ -332,8 +328,6 @@ A few things mirror the framework semantics described above:
 | **IFD** (Cherry LLM) | `ifd` | NAACL 2024 | Self-guided Instruction-Following Difficulty; quality over quantity. |
 | **LESS** | `less` | ICML 2024 | Selecting influential data for *targeted* tuning via LoRA gradient influence. |
 | **MIWV** | `miwv` | AAAI 2026 | Rank samples by the ICL-based Model Instruction Weakness Value (training-free). |
-| **GREATS** | `greats` | NeurIPS 2024 | **Online** batch selection: keep the most useful *and diverse* size-k subset each step. |
-| **ADAPT** | `adapt` | ICLR 2026 | **Online** per-sample reweighting instead of offline subset selection. |
 
 Baselines (also usable directly, or via the default method with `--scorer …`):
 

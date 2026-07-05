@@ -14,9 +14,9 @@ The selector itself is just "score, then apply the policy" offline -- identical 
 the thin per-scorer selectors (``alg/bm25.py`` etc.), but with the scorer resolved
 by name at runtime rather than hard-imported.
 
-For anything finer-grained -- multiple scorers, custom plumbing, an online
-reweighting trainer -- write a dedicated ``alg/<name>.py`` and select it with
-``--method <name>`` (see ``alg/less.py``, ``alg/adapt.py``). Such a method wires
+For anything finer-grained -- multiple scorers or custom scoring plumbing --
+write a dedicated ``alg/<name>.py`` and select it with ``--method <name>`` (see
+``alg/less.py``, ``alg/ifd.py``). Such a method wires
 its own scorer *and* policy, so ``--scorer`` and ``--policy`` are both ignored
 once ``--method`` is not ``default`` (the method's policy is its module-level
 ``DEFAULT_POLICY``, else ``hard``). ``--scorer``/``--policy`` only apply here.

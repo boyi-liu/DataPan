@@ -72,7 +72,6 @@ def build_training_args(cfg, num_train_examples=None):
 def build_trainer(cfg, model, tokenizer, train_dataset, eval_dataset=None,
                   training_args=None):
     # Honor `lora.enable`: fine-tune adapters instead of all ~Bn parameters.
-    # (ADAPT wraps LoRA in its own trainer; this covers the generic path.)
     from utils.model_utils import maybe_wrap_lora
 
     model = maybe_wrap_lora(cfg, model)
@@ -95,14 +94,9 @@ def build_trainer(cfg, model, tokenizer, train_dataset, eval_dataset=None,
     )
 
 
-def train(cfg, model, tokenizer, train_dataset, eval_dataset=None, trainer=None):
-    """Fine-tune ``model`` on ``train_dataset`` and persist the result.
-
-    ``trainer`` may be a pre-built (e.g. method-specific) Trainer; when ``None``
-    a generic one is constructed.
-    """
-    if trainer is None:
-        trainer = build_trainer(cfg, model, tokenizer, train_dataset, eval_dataset)
+def train(cfg, model, tokenizer, train_dataset, eval_dataset=None):
+    """Fine-tune ``model`` on ``train_dataset`` and persist the result."""
+    trainer = build_trainer(cfg, model, tokenizer, train_dataset, eval_dataset)
     trainer.train()
     os.makedirs(cfg.output_dir, exist_ok=True)
     trainer.save_model(cfg.output_dir)

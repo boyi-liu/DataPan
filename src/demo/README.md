@@ -33,9 +33,9 @@ python3 -m streamlit run src/demo/streamlit_app.py
 
 Matching the framework (`main._stage_cfg`): a card's **scorer** and **policy**
 are editable **only when `method: default`** — the one operator that composes a
-scorer + policy. Concrete methods (`less`, `ifd`, `greats`, `adapt`, `miwv`, …)
-wire their own and ignore those fields, so they are greyed out; a method that
-pins a policy in code (`adapt → reweight`, `greats → greats`) shows it read-only.
+scorer + policy. Concrete methods (`less`, `ifd`, `miwv`, …) wire their own and
+ignore those fields, so they are greyed out and show their fixed policy
+(`hard`) read-only.
 
 ## Real vs. simulated selection
 

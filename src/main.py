@@ -1,12 +1,23 @@
 """Entry point for the data-selection pipeline.
 
-    python main.py --dataset a --method less --budget 0.05
-    python main.py --method random --no-train             # baseline, selection only
-    python main.py --dataset a --method less --benchmark gsm8k --eval-limit 200
+The three phases -- ``select``, ``train``, ``eval`` -- are fully decoupled and
+run ONE AT A TIME via ``--stage``. Each stage force-saves its output at the end
+and force-loads the previous stage's output at the start, so a full run is three
+separate invocations that hand artifacts to each other through ``--output-dir``:
 
-Flow:
-    parse args -> load model+tokenizer -> load dataset -> select subset
-               -> (optionally) fine-tune -> (optionally) evaluate a benchmark
+    python main.py --stage select --dataset alpaca --method less --budget 0.05
+    python main.py --stage train                                   # trains the saved subset
+    python main.py --stage eval  --benchmark gsm8k --eval-limit 200
+
+Flow per stage:
+    select : load model+tokenizer -> load dataset -> run operator cascade
+             -> save selected_dataset/ + val_dataset/ + selection.json
+    train  : load selected_dataset/ -> fine-tune -> save the model checkpoint
+    eval   : load the fine-tuned model -> run a benchmark -> save eval.json
+
+Because the stages share nothing but on-disk artifacts, point every invocation
+of one run at the same ``--output-dir`` (and pass the same ``--config``/method
+flags, which stay the source of truth for configuration).
 """
 
 import argparse
@@ -18,7 +29,7 @@ import warnings
 from dataset import get_dataset
 from alg import get_selector
 from planner import build_planner
-from utils.model_utils import load_model_and_tokenizer
+from utils.model_utils import load_model, load_tokenizer, load_model_and_tokenizer
 from utils.options import Config, parse_args, _default_policy
 from utils.train_utils import set_seed, train as run_training
 
@@ -127,7 +138,7 @@ def _stage_cfg(base_cfg, stage):
                 stacklevel=2,
             )
         scorer = None  # custom methods hard-wire their own scorer
-        policy = _default_policy(method) or "hard"  # e.g. adapt -> reweight
+        policy = _default_policy(method) or "hard"  # method's DEFAULT_POLICY, else hard
 
     # 1) Method/scorer/policy defaults, so a stage's YAML lists only what differs.
     defaults = _plugin_defaults("alg", method)
@@ -161,7 +172,7 @@ def run_pipeline(cfg, model, tokenizer, train_set, val_set):
     Stages come from a :class:`planner.Planner` (default: replay ``cfg.pipeline``;
     ``pipeline_planner.type: llm`` lets an LLM choose each stage from live state).
     ``indices`` are into the original ``train_set``. ``last_selector`` is the
-    final stage's operator (whose ``make_trainer`` the final training may use).
+    final stage's operator.
     """
     planner = build_planner(cfg)
     top_name = cfg.model.name
@@ -239,65 +250,173 @@ def run_pipeline(cfg, model, tokenizer, train_set, val_set):
     return sorted(survivors), last_selector, log
 
 
+# ---------------------------------------------------------------------------
+# Stages: select / train / eval, each a standalone step
+# ---------------------------------------------------------------------------
+# The three phases are fully decoupled and run one at a time (``--stage``). They
+# communicate ONLY through artifacts under ``cfg.output_dir`` -- each stage
+# force-saves its output at the end and force-loads the prior stage's output at
+# the start, so a run is three separate invocations:
+#
+#     python main.py --stage select --method less --budget 0.05
+#     python main.py --stage train
+#     python main.py --stage eval  --benchmark gsm8k
+#
+# Artifact layout under ``output_dir``:
+#   selection.json      -- provenance: pipeline log, indices, final method   (select ->)
+#   selected_dataset/   -- the selected training subset (HF save_to_disk)    (select -> train)
+#   val_dataset/        -- validation/anchor split, if any                   (select -> train)
+#   <model files>       -- fine-tuned adapter/checkpoint at the dir root     (train  -> eval)
+#   eval.json           -- benchmark metrics                                 (eval  ->)
+STAGES = ("select", "train", "eval")
+
+
+def _selected_dir(cfg):
+    return os.path.join(cfg.output_dir, "selected_dataset")
+
+
+def _val_dir(cfg):
+    return os.path.join(cfg.output_dir, "val_dataset")
+
+
+def _save_dataset(dataset, path):
+    """Force-save an HF dataset to ``path`` (replacing any prior copy)."""
+    import shutil
+    if os.path.exists(path):
+        shutil.rmtree(path)
+    dataset.save_to_disk(path)
+    return path
+
+
+def _load_trained_model(cfg):
+    """Load a previously fine-tuned model from ``cfg.output_dir`` for eval.
+
+    Handles both save layouts of ``train_utils.train``: a LoRA adapter
+    (``adapter_config.json`` -> base model + adapter) or a full checkpoint
+    (``config.json`` + weights saved directly into ``output_dir``).
+    """
+    out = cfg.output_dir
+    if os.path.exists(os.path.join(out, "adapter_config.json")):
+        from peft import PeftModel
+        base = load_model(cfg)
+        model = PeftModel.from_pretrained(base, out)
+        return model.to(cfg.device)
+    has_weights = any(
+        os.path.exists(os.path.join(out, f))
+        for f in ("model.safetensors", "pytorch_model.bin",
+                  "model.safetensors.index.json", "pytorch_model.bin.index.json")
+    )
+    if os.path.exists(os.path.join(out, "config.json")) and has_weights:
+        full_cfg = _clone_cfg(cfg)
+        full_cfg.set_path("model.name", out)
+        return load_model(full_cfg)
+    raise SystemExit(
+        f"'eval' stage found no trained model in {out} (no adapter_config.json or "
+        f"model weights). Run `--stage train` first, or point --output-dir at a run.")
+
+
+# ---------------------------------------------------------------------------
+# The three stages
+# ---------------------------------------------------------------------------
+def stage_select(cfg):
+    """Read the dataset, run the operator cascade, and save the selected subset."""
+    print(f"[select] loading model & tokenizer: {cfg.model.name}")
+    model, tokenizer = load_model(cfg), load_tokenizer(cfg)
+
+    print(f"[select] loading dataset: {cfg.dataset.name}")
+    data = get_dataset(cfg, tokenizer)
+    train_set, val_set = data["train"], data.get("validation")
+    print(f"         train={len(train_set)} | "
+          f"validation={len(val_set) if val_set is not None else 0}")
+
+    planner_type = (cfg.get("pipeline_planner") or {}).get("type") or "list"
+    if planner_type == "list":
+        print(f"[select] {len(cfg.pipeline or [])}-stage pipeline")
+    else:
+        print(f"[select] {planner_type}-planned pipeline (adaptive)")
+    indices, _last_selector, log = run_pipeline(cfg, model, tokenizer, train_set, val_set)
+    selected = train_set.select(indices)
+
+    # Force-save this stage's output: the subset (and val/anchor split) the train
+    # stage will consume, plus a provenance record naming the final operator.
+    os.makedirs(cfg.output_dir, exist_ok=True)
+    _save_dataset(selected, _selected_dir(cfg))
+    if val_set is not None:
+        _save_dataset(val_set, _val_dir(cfg))
+    out = _save_json(cfg, "selection.json", {
+        "pipeline": log,
+        "num_selected": len(indices),
+        "selected_indices": indices,
+        "method": log[-1]["method"] if log else None,
+    })
+    print(f"      kept {len(indices)}/{len(train_set)} examples")
+    print(f"      saved subset -> {_selected_dir(cfg)}  (provenance -> {out})")
+
+
+def stage_train(cfg):
+    """Load the selected subset from the ``select`` stage, fine-tune, save the model."""
+    from datasets import load_from_disk
+
+    sel_dir = _selected_dir(cfg)
+    if not os.path.exists(sel_dir):
+        raise SystemExit(
+            f"'train' stage needs a selection but {sel_dir} was not found. "
+            f"Run `--stage select` first (writing to the same --output-dir).")
+    selected = load_from_disk(sel_dir)
+    val_set = load_from_disk(_val_dir(cfg)) if os.path.exists(_val_dir(cfg)) else None
+    print(f"[train] loaded {len(selected)} selected examples from {sel_dir}")
+
+    print(f"[load] model & tokenizer: {cfg.model.name}")
+    model, tokenizer = load_model(cfg), load_tokenizer(cfg)
+
+    print(f"[train] fine-tuning on {len(selected)} selected examples")
+    run_training(cfg, model, tokenizer, selected, val_set)
+    # ``train`` force-saves the model (trainer.save_model) inside run_training.
+    print(f"      model saved -> {cfg.output_dir}")
+
+
+def stage_eval(cfg, benchmark, limit):
+    """Load the fine-tuned model from the ``train`` stage, benchmark it, save metrics."""
+    from utils.eval_utils import evaluate
+
+    print(f"[eval] loading trained model from {cfg.output_dir}")
+    model = _load_trained_model(cfg)
+    tokenizer = load_tokenizer(cfg)
+
+    print(f"[eval] evaluating on {benchmark}")
+    result = evaluate(cfg, model, tokenizer, benchmark, limit=limit)
+    out = _save_json(cfg, "eval.json", result)
+    print(f"      {benchmark}: {result['metric']}={result['score']:.4f} "
+          f"(n={result['n']}) -> {out}")
+
+
 def main():
-    # Run-level flags layered on top of the config-driven options.
+    # Exactly one stage per run; stages hand off through --output-dir artifacts.
     pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--no-train", action="store_true",
-                     help="Run selection only; skip the final fine-tuning.")
+    pre.add_argument("--stage", default="select", choices=STAGES,
+                     help="Which single phase to run (default: select): 'select' "
+                          "(dataset -> subset), 'train' (subset -> model), or 'eval' "
+                          "(model -> metrics). Each reads the previous stage's output "
+                          "from --output-dir.")
     pre.add_argument("--benchmark", default=None,
-                     help="Evaluate this benchmark after training (e.g. gsm8k).")
+                     help="Benchmark to evaluate (e.g. gsm8k). Required by --stage eval.")
     pre.add_argument("--eval-limit", type=int, default=100,
                      help="Number of benchmark examples to evaluate.")
     known, remaining = pre.parse_known_args()
 
     cfg = parse_args(remaining)
     set_seed(cfg.seed)
+    print(f"[stage] {known.stage}")
 
-    print(f"[1/5] Loading model & tokenizer: {cfg.model.name}")
-    model, tokenizer = load_model_and_tokenizer(cfg)
-
-    print(f"[2/5] Loading dataset: {cfg.dataset.name}")
-    data = get_dataset(cfg, tokenizer)
-    train_set, val_set = data["train"], data.get("validation")
-    print(f"      train={len(train_set)} | "
-          f"validation={len(val_set) if val_set is not None else 0}")
-
-    planner_type = (cfg.get("pipeline_planner") or {}).get("type") or "list"
-    if planner_type == "list":
-        print(f"[3/5] Selecting data: {len(cfg.pipeline or [])}-stage pipeline")
-    else:
-        print(f"[3/5] Selecting data: {planner_type}-planned pipeline (adaptive)")
-    indices, last_selector, log = run_pipeline(cfg, model, tokenizer, train_set, val_set)
-    selected = train_set.select(indices)
-    out = _save_json(cfg, "selection.json", {
-        "pipeline": log,
-        "num_selected": len(indices),
-        "selected_indices": indices,
-    })
-    print(f"      kept {len(indices)}/{len(train_set)} examples -> {out}")
-
-    if known.no_train:
-        print("[4/5] --no-train set; skipping fine-tuning and evaluation.")
-        return
-
-    print(f"[4/5] Fine-tuning on {len(selected)} selected examples")
-    # The final stage's operator may inject a trainer (e.g. an online method like
-    # ADAPT ending the pipeline); otherwise fall back to the generic Trainer. An
-    # adaptive planner may also run zero stages (immediate stop) -> no selector.
-    trainer = (last_selector.make_trainer(cfg, model, tokenizer, selected, val_set)
-               if last_selector is not None else None)
-    run_training(cfg, model, tokenizer, selected, val_set, trainer=trainer)
-    print(f"      artifacts in {cfg.output_dir}")
-
-    if known.benchmark:
-        print(f"[5/5] Evaluating on {known.benchmark}")
-        from utils.eval_utils import evaluate
-        result = evaluate(cfg, model, tokenizer, known.benchmark, limit=known.eval_limit)
-        _save_json(cfg, "eval.json", result)
-        print(f"      {known.benchmark}: {result['metric']}={result['score']:.4f} "
-              f"(n={result['n']})")
-    else:
-        print("[5/5] No --benchmark given; done.")
+    if known.stage == "select":
+        stage_select(cfg)
+    elif known.stage == "train":
+        stage_train(cfg)
+    else:  # eval
+        if not known.benchmark:
+            raise SystemExit("--stage eval requires --benchmark NAME (e.g. "
+                             "--benchmark gsm8k).")
+        stage_eval(cfg, known.benchmark, known.eval_limit)
 
 
 if __name__ == "__main__":

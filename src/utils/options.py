@@ -140,8 +140,9 @@ def _add_plugin_args(parser, package, name):
 
 
 def _default_policy(method):
-    """A method may declare ``DEFAULT_POLICY`` in ``alg/<method>.py`` (e.g. ADAPT
-    -> 'reweight'), used when neither the CLI nor config.yaml pins ``--policy``."""
+    """A method may declare ``DEFAULT_POLICY`` in ``alg/<method>.py`` (e.g. a
+    method that pins 'diversity'), used when neither the CLI nor config.yaml
+    pins ``--policy``."""
     if not method:
         return None
     try:
