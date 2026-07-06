@@ -32,7 +32,7 @@ eval:
   backend: hf                  # hf | vllm
   max_new_tokens: 256
   batch_size: 16               # hf backend: prompts per forward pass (vllm batches internally)
-  gpu_memory_utilization: 0.9  # vllm backend only
+  gpu_memory_utilization: 0.5  # vllm backend only; conservative for shared GPUs
 
 # ---- LoRA (used for the warmup / influence model) ----
 lora:
