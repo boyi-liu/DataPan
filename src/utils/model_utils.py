@@ -1,7 +1,7 @@
 """Model and tokenizer loading utilities."""
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 _DTYPE = {
     "float32": torch.float32,
@@ -31,7 +31,18 @@ def load_model(cfg):
         kwargs["load_in_8bit"] = True
         kwargs["device_map"] = "auto"
 
-    model = AutoModelForCausalLM.from_pretrained(cfg.model.name, **kwargs)
+    # transformers 5.x reads ``config.pad_token_id`` during Qwen2Model init, so
+    # the config needs the attribute set even when the tokenizer's pad token is
+    # the same as bos/eos (the default for Qwen2.5-Instruct). Qwen2Config leaves
+    # it as ``None``, which trips an AttributeError, so seed it from the tokenizer.
+    config = AutoConfig.from_pretrained(
+        cfg.model.name, trust_remote_code=bool(cfg.model.trust_remote_code),
+    )
+    if not getattr(config, "pad_token_id", None):
+        tokenizer = load_tokenizer(cfg)
+        config.pad_token_id = tokenizer.pad_token_id
+
+    model = AutoModelForCausalLM.from_pretrained(cfg.model.name, config=config, **kwargs)
 
     # When not using 8-bit/device_map, place the model explicitly.
     if not cfg.model.load_in_8bit:
@@ -88,7 +99,11 @@ def load_vllm(cfg, model_path, adapter_dir=None):
         "model": model_path,
         "trust_remote_code": bool(cfg.model.trust_remote_code),
         "dtype": cfg.model.torch_dtype or "auto",
-        "gpu_memory_utilization": cfg.get_path("eval.gpu_memory_utilization") or 0.9,
+        "gpu_memory_utilization": cfg.get_path("eval.gpu_memory_utilization") or 0.5,
+        # Skip CUDA-graph capture; avoids the vLLM 0.10 V1 JIT-compile path
+        # (FlashInfer/Triton kernels) that needs CUDA dev headers not present
+        # on many boxes. For full startup, also set VLLM_USE_V1=0.
+        "enforce_eager": True,
     }
     if cfg.model.max_length:
         kwargs["max_model_len"] = cfg.model.max_length
