@@ -9,3 +9,6 @@ tqdm
 
 # Only needed by the embedding-based selectors (alg/miwv.py)
 sentence-transformers>=2.6
+
+# Only needed for the fast eval backend (--eval-backend vllm); CUDA GPU required
+# vllm>=0.6

@@ -20,7 +20,15 @@ previous stage's output, communicating only through artifacts under
 python main.py --stage select --dataset alpaca --method less --budget 0.05
 python main.py --stage train                                   # fine-tune the saved subset
 python main.py --stage eval  --benchmark gsm8k --eval-limit 200
+python main.py --stage eval  --benchmark gsm8k --eval-backend vllm   # same, but fast
 ```
+
+The `eval` stage generates with one of two backends (`eval.backend`, or
+`--eval-backend`): **`hf`** (transformers, always available; prompts are batched
+via `eval.batch_size`) or **`vllm`** — vLLM's batched decoding engine, much
+faster on a CUDA GPU (`pip install vllm`). vLLM loads the trained checkpoint from
+`--output-dir` directly, or the base model + LoRA adapter when the train stage
+saved an adapter — no extra flags needed.
 
 What each stage reads and writes (all under `--output-dir`):
 

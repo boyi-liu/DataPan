@@ -104,8 +104,56 @@ BENCHMARKS = {
 }
 
 
+# --------------------------------------------------------------------------- #
+# Generation backends
+# --------------------------------------------------------------------------- #
 @torch.no_grad()
-def evaluate(cfg, model, tokenizer, benchmark="gsm8k", limit=100, max_new_tokens=256):
+def _generate_hf(cfg, model, tokenizer, prompts, max_new_tokens):
+    """Greedy generation via transformers, batched for throughput.
+
+    Prompts are left-padded so the generated tokens line up at the right edge of
+    every row, letting us slice them off with a single prompt-length offset.
+    """
+    model.eval()
+    batch_size = cfg.get_path("eval.batch_size") or 16
+    prev_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+    gens = []
+    try:
+        for start in range(0, len(prompts), batch_size):
+            batch = prompts[start:start + batch_size]
+            enc = tokenizer(batch, return_tensors="pt", truncation=True,
+                            max_length=cfg.model.max_length, padding=True).to(cfg.device)
+            out = model.generate(
+                **enc, max_new_tokens=max_new_tokens, do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+            gen_ids = out[:, enc["input_ids"].shape[1]:]
+            gens.extend(tokenizer.batch_decode(gen_ids, skip_special_tokens=True))
+    finally:
+        tokenizer.padding_side = prev_side
+    return gens
+
+
+def _generate_vllm(llm, prompts, max_new_tokens, lora_request):
+    """Greedy generation via vLLM. ``llm`` is a ``vllm.LLM`` built by
+    ``model_utils.load_vllm``; outputs come back in input order."""
+    from vllm import SamplingParams
+
+    sampling = SamplingParams(temperature=0.0, max_tokens=max_new_tokens)
+    kwargs = {"lora_request": lora_request} if lora_request is not None else {}
+    outputs = llm.generate(prompts, sampling, **kwargs)
+    return [o.outputs[0].text for o in outputs]
+
+
+def evaluate(cfg, model, tokenizer, benchmark="gsm8k", limit=100,
+             max_new_tokens=None, lora_request=None):
+    """Benchmark ``model`` on ``benchmark``.
+
+    The generation engine is chosen by ``cfg.eval.backend`` (``hf`` | ``vllm``):
+    for ``hf`` pass a transformers model; for ``vllm`` pass a ``vllm.LLM`` (see
+    ``main.stage_eval``). Scoring is backend-agnostic.
+    """
     if benchmark not in BENCHMARKS:
         raise ValueError(f"Unknown benchmark {benchmark!r}; choices: {list(BENCHMARKS)}")
     spec = BENCHMARKS[benchmark]
@@ -113,17 +161,16 @@ def evaluate(cfg, model, tokenizer, benchmark="gsm8k", limit=100, max_new_tokens
     metric_name = spec["metric"]
     score_fn = METRICS[metric_name]
 
-    model.eval()
-    total = 0.0
-    for prompt, gold in zip(prompts, golds):
-        enc = tokenizer(prompt, return_tensors="pt", truncation=True,
-                        max_length=cfg.model.max_length).to(cfg.device)
-        out = model.generate(
-            **enc, max_new_tokens=max_new_tokens, do_sample=False,
-            pad_token_id=tokenizer.pad_token_id,
-        )
-        gen = tokenizer.decode(out[0, enc["input_ids"].shape[1]:], skip_special_tokens=True)
-        total += score_fn(gen, gold)
+    if max_new_tokens is None:
+        max_new_tokens = cfg.get_path("eval.max_new_tokens") or 256
+    backend = (cfg.get_path("eval.backend") or "hf").lower()
 
+    if backend == "vllm":
+        gens = _generate_vllm(model, prompts, max_new_tokens, lora_request)
+    else:
+        gens = _generate_hf(cfg, model, tokenizer, prompts, max_new_tokens)
+
+    total = sum(score_fn(gen, gold) for gen, gold in zip(gens, golds))
     score = total / max(1, len(golds))
-    return {"benchmark": benchmark, "n": len(golds), "metric": metric_name, "score": score}
+    return {"benchmark": benchmark, "n": len(golds), "metric": metric_name,
+            "score": score, "backend": backend}

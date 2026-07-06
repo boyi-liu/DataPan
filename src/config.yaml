@@ -20,6 +20,20 @@ model:
   load_in_8bit: false
   trust_remote_code: false
 
+# ---- Evaluation (the `eval` stage: benchmark the trained model) ----
+# `backend` picks the generation engine:
+#   hf   -- transformers `model.generate`, always available; prompts are batched
+#           (`batch_size`) but decoding is still comparatively slow.
+#   vllm -- vLLM's batched/continuous-decoding engine, much faster on a CUDA GPU.
+#           Needs `pip install vllm`. It loads the trained checkpoint from
+#           --output-dir directly, or the base model + LoRA adapter when the
+#           train stage saved an adapter. Override per run with --eval-backend.
+eval:
+  backend: hf                  # hf | vllm
+  max_new_tokens: 256
+  batch_size: 16               # hf backend: prompts per forward pass (vllm batches internally)
+  gpu_memory_utilization: 0.9  # vllm backend only
+
 # ---- LoRA (used for the warmup / influence model) ----
 lora:
   enable: true

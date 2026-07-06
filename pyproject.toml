@@ -32,6 +32,8 @@ dependencies = [
 [project.optional-dependencies]
 # Only needed by the embedding-based selectors (alg/miwv.py).
 embed = ["sentence-transformers>=2.6"]
+# Fast batched eval backend (--stage eval --eval-backend vllm); CUDA GPU required.
+vllm = ["vllm>=0.6"]
 
 [project.urls]
 Repository = "https://github.com/boyi-liu/LLM-Finetune-Data-Curator"

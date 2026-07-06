@@ -288,31 +288,44 @@ def _save_dataset(dataset, path):
     return path
 
 
-def _load_trained_model(cfg):
-    """Load a previously fine-tuned model from ``cfg.output_dir`` for eval.
+def _resolve_trained_model(cfg):
+    """Locate the model produced by the ``train`` stage in ``cfg.output_dir``.
 
-    Handles both save layouts of ``train_utils.train``: a LoRA adapter
-    (``adapter_config.json`` -> base model + adapter) or a full checkpoint
-    (``config.json`` + weights saved directly into ``output_dir``).
+    Handles both save layouts of ``train_utils.train`` and returns
+    ``(model_path, adapter_dir)``:
+
+    * LoRA adapter (``adapter_config.json``) -> ``(base model name, adapter dir)``
+    * full checkpoint (``config.json`` + weights) -> ``(checkpoint dir, None)``
+
+    Shared by the HF loader (``_load_trained_model``) and the vLLM loader so the
+    disk-layout logic lives in exactly one place.
     """
     out = cfg.output_dir
     if os.path.exists(os.path.join(out, "adapter_config.json")):
-        from peft import PeftModel
-        base = load_model(cfg)
-        model = PeftModel.from_pretrained(base, out)
-        return model.to(cfg.device)
+        return cfg.model.name, out
     has_weights = any(
         os.path.exists(os.path.join(out, f))
         for f in ("model.safetensors", "pytorch_model.bin",
                   "model.safetensors.index.json", "pytorch_model.bin.index.json")
     )
     if os.path.exists(os.path.join(out, "config.json")) and has_weights:
-        full_cfg = _clone_cfg(cfg)
-        full_cfg.set_path("model.name", out)
-        return load_model(full_cfg)
+        return out, None
     raise SystemExit(
         f"'eval' stage found no trained model in {out} (no adapter_config.json or "
         f"model weights). Run `--stage train` first, or point --output-dir at a run.")
+
+
+def _load_trained_model(cfg):
+    """Load a previously fine-tuned model from ``cfg.output_dir`` for HF eval."""
+    model_path, adapter_dir = _resolve_trained_model(cfg)
+    if adapter_dir:
+        from peft import PeftModel
+        base = load_model(cfg)
+        model = PeftModel.from_pretrained(base, adapter_dir)
+        return model.to(cfg.device)
+    full_cfg = _clone_cfg(cfg)
+    full_cfg.set_path("model.name", model_path)
+    return load_model(full_cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -376,15 +389,29 @@ def stage_train(cfg):
 
 
 def stage_eval(cfg, benchmark, limit):
-    """Load the fine-tuned model from the ``train`` stage, benchmark it, save metrics."""
+    """Load the fine-tuned model from the ``train`` stage, benchmark it, save metrics.
+
+    ``cfg.eval.backend`` picks the generation engine: ``hf`` loads the model with
+    transformers; ``vllm`` loads the same checkpoint (or base + LoRA adapter) into
+    a vLLM engine for much faster batched decoding.
+    """
     from utils.eval_utils import evaluate
 
-    print(f"[eval] loading trained model from {cfg.output_dir}")
-    model = _load_trained_model(cfg)
+    backend = (cfg.get_path("eval.backend") or "hf").lower()
     tokenizer = load_tokenizer(cfg)
+    lora_request = None
+    if backend == "vllm":
+        from utils.model_utils import load_vllm
+        model_path, adapter_dir = _resolve_trained_model(cfg)
+        print(f"[eval] loading trained model into vLLM from {cfg.output_dir}")
+        model, lora_request = load_vllm(cfg, model_path, adapter_dir)
+    else:
+        print(f"[eval] loading trained model from {cfg.output_dir}")
+        model = _load_trained_model(cfg)
 
-    print(f"[eval] evaluating on {benchmark}")
-    result = evaluate(cfg, model, tokenizer, benchmark, limit=limit)
+    print(f"[eval] evaluating on {benchmark} (backend={backend})")
+    result = evaluate(cfg, model, tokenizer, benchmark, limit=limit,
+                      lora_request=lora_request)
     out = _save_json(cfg, "eval.json", result)
     print(f"      {benchmark}: {result['metric']}={result['score']:.4f} "
           f"(n={result['n']}) -> {out}")
@@ -402,9 +429,15 @@ def main():
                      help="Benchmark to evaluate (e.g. gsm8k). Required by --stage eval.")
     pre.add_argument("--eval-limit", type=int, default=100,
                      help="Number of benchmark examples to evaluate.")
+    pre.add_argument("--eval-backend", default=None, choices=["hf", "vllm"],
+                     help="Generation engine for --stage eval: 'hf' (transformers, "
+                          "default) or 'vllm' (faster batched decoding; needs a CUDA "
+                          "GPU + `pip install vllm`). Overrides eval.backend in config.")
     known, remaining = pre.parse_known_args()
 
     cfg = parse_args(remaining)
+    if known.eval_backend:
+        cfg.set_path("eval.backend", known.eval_backend)
     set_seed(cfg.seed)
     print(f"[stage] {known.stage}")
 

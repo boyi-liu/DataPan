@@ -65,3 +65,37 @@ def maybe_wrap_lora(cfg, model):
 
 def load_model_and_tokenizer(cfg):
     return load_model(cfg), load_tokenizer(cfg)
+
+
+def load_vllm(cfg, model_path, adapter_dir=None):
+    """Build a vLLM engine for fast batched evaluation.
+
+    ``model_path`` is what vLLM loads: a full checkpoint dir, or the base model
+    name when ``adapter_dir`` points at a LoRA adapter saved by the train stage.
+    Returns ``(llm, lora_request)`` -- ``lora_request`` is ``None`` unless a LoRA
+    adapter is attached, in which case pass it to ``llm.generate(...)``.
+    """
+    try:
+        from vllm import LLM
+        from vllm.lora.request import LoRARequest
+    except ImportError as exc:
+        raise ImportError(
+            "vLLM eval backend requested but `vllm` is not installed. Install it "
+            "with `pip install vllm` (CUDA GPU required), or set eval.backend=hf."
+        ) from exc
+
+    kwargs = {
+        "model": model_path,
+        "trust_remote_code": bool(cfg.model.trust_remote_code),
+        "dtype": cfg.model.torch_dtype or "auto",
+        "gpu_memory_utilization": cfg.get_path("eval.gpu_memory_utilization") or 0.9,
+    }
+    if cfg.model.max_length:
+        kwargs["max_model_len"] = cfg.model.max_length
+
+    lora_request = None
+    if adapter_dir:
+        kwargs["enable_lora"] = True
+        lora_request = LoRARequest("trained", 1, adapter_dir)
+
+    return LLM(**kwargs), lora_request

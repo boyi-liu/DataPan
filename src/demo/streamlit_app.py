@@ -569,6 +569,8 @@ if ss.selected:
     tbatch = t[2].number_input("batch size", value=4, min_value=1)
     tlr = t[3].text_input("learning rate", value="2e-5")
     tbench = t[0].selectbox("eval benchmark", ["(none)", "gsm8k", "dialogsum"])
+    tbackend = t[1].selectbox("eval backend", ["hf", "vllm"],
+                              help="vllm = faster batched decoding (CUDA GPU + `pip install vllm`)")
     # The exported selected.jsonl is *already* the curated subset, so the select
     # stage keeps all of it (--method random --budget 1.0) rather than filtering
     # again. train then reads that saved subset; eval reads the trained model.
@@ -579,7 +581,8 @@ if ss.selected:
         f"--epochs {tepochs} --batch-size {tbatch} --lr {tlr}",
     ]
     if tbench != "(none)":
-        lines.append(f"python main.py --stage eval   {common} --benchmark {tbench}")
+        lines.append(f"python main.py --stage eval   {common} --benchmark {tbench} "
+                     f"--eval-backend {tbackend}")
     cli = "\n".join(lines)
     if st.button("🚀 Start training"):
         n_sel = len(ss.selected)
