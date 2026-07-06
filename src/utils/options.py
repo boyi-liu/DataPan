@@ -78,7 +78,17 @@ def load_config(path):
 
 def _coerce(value):
     """Parse a CLI string into a typed value (int/float/bool/list/...)."""
-    return yaml.safe_load(value)
+    parsed = yaml.safe_load(value)
+    # ``yaml.safe_load("2e-5")`` returns the string ``"2e-5"`` rather than a
+    # float; only the ``2.0e-5``/``2E-5`` forms round-trip. Try a direct
+    # ``float()`` for the common scientific-notation case so an override like
+    # ``-o train.lr=2e-5`` is honoured instead of reaching the optimizer as a str.
+    if isinstance(parsed, str):
+        try:
+            return float(parsed)
+        except ValueError:
+            return parsed
+    return parsed
 
 
 def build_parser():
